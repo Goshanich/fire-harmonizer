@@ -1,0 +1,26 @@
+# Secrets & local environment
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# Python virtual environment, caches, and temp files
+.venv/
+.tmp/
+.cache/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Ignore raw downloads & generated outputs, keep sample/ and calibration tables for offline/cloud demo
+data/raw/
+data/processed/*.csv
+!data/processed/calibration_alpha_*.csv
+!data/sample/
+!data/sample/*.csv
+
+# OS / IDE artifacts
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
