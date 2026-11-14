@@ -288,14 +288,14 @@ def compute_overlap_calibration(
         prefix = sensor_name.lower()
         if sub.empty:
             return pd.DataFrame(
-                columns=[
-                    "year",
-                    "month",
-                    "daynight",
-                    f"{prefix}_active_cells",
-                    f"{prefix}_raw_points",
-                    f"{prefix}_frp_sum",
-                ]
+                {
+                    "year": pd.Series(dtype="int64"),
+                    "month": pd.Series(dtype="int64"),
+                    "daynight": pd.Series(dtype="object"),
+                    f"{prefix}_active_cells": pd.Series(dtype="float64"),
+                    f"{prefix}_raw_points": pd.Series(dtype="float64"),
+                    f"{prefix}_frp_sum": pd.Series(dtype="float64"),
+                }
             )
         return sub.groupby(["year", "month", "daynight"], as_index=False).agg(
             **{
@@ -311,36 +311,65 @@ def compute_overlap_calibration(
     paired = pd.merge(m_ov, v_ov, on=["year", "month", "daynight"], how="outer").fillna(0.0)
     paired_valid = paired[paired["viirs_active_cells"] > 0].copy()
 
+    default_alpha_by_dn: dict[str, float] = {"D": 0.85, "N": 0.36}
+    default_alpha_overall: float = 0.60
+
+    def _safe_median_ratios(df_sub: pd.DataFrame) -> tuple[float, float, float]:
+        med_v_cells = float(np.median(df_sub["viirs_active_cells"]))
+        med_m_cells = float(np.median(df_sub["modis_active_cells"]))
+        a_cells = float(med_m_cells / max(med_v_cells, 1e-6))
+
+        med_m_frp = float(np.median(df_sub["modis_frp_sum"]))
+        med_v_frp = float(np.median(df_sub["viirs_frp_sum"]))
+        a_frp = float(med_m_frp / max(med_v_frp, 1e-6)) if med_m_frp > 0 and med_v_frp > 0 else a_cells
+
+        med_m_raw = float(np.median(df_sub["modis_raw_points"]))
+        med_v_raw = float(np.median(df_sub["viirs_raw_points"]))
+        r_raw = float(med_m_raw / max(med_v_raw, 1e-6)) if med_m_raw > 0 and med_v_raw > 0 else a_cells
+        return a_cells, a_frp, r_raw
+
     # Global and day/night fallback ratios in case a specific (month, daynight) slice is sparse
-    if not paired_valid.empty and paired_valid["modis_active_cells"].sum() > 0:
-        global_alpha_cells = float(
-            np.median(paired_valid["modis_active_cells"])
-            / max(np.median(paired_valid["viirs_active_cells"]), 1e-6)
-        )
-        global_alpha_frp = float(
-            np.median(paired_valid["modis_frp_sum"])
-            / max(np.median(paired_valid["viirs_frp_sum"]), 1e-6)
-        )
-        global_raw_ratio = float(
-            np.median(paired_valid["modis_raw_points"])
-            / max(np.median(paired_valid["viirs_raw_points"]), 1e-6)
-        )
+    coactive_all = paired_valid[paired_valid["modis_active_cells"] > 0]
+    has_global_modis = True
+    if (
+        not paired_valid.empty
+        and np.median(paired_valid["modis_active_cells"]) > 0
+        and np.median(paired_valid["viirs_active_cells"]) > 0
+    ):
+        global_alpha_cells, global_alpha_frp, global_raw_ratio = _safe_median_ratios(paired_valid)
+    elif (
+        len(coactive_all) >= 3
+        and np.median(coactive_all["modis_active_cells"]) > 0
+        and np.median(coactive_all["viirs_active_cells"]) > 0
+    ):
+        global_alpha_cells, global_alpha_frp, global_raw_ratio = _safe_median_ratios(coactive_all)
     else:
-        global_alpha_cells = 1.0
-        global_alpha_frp = 1.0
-        global_raw_ratio = 1.0
+        has_global_modis = False
+        global_alpha_cells = default_alpha_overall
+        global_alpha_frp = default_alpha_overall
+        global_raw_ratio = default_alpha_overall
 
     dn_fallbacks: dict[str, tuple[float, float, float]] = {}
     for dn in ("D", "N"):
         sub_dn = paired_valid[paired_valid["daynight"] == dn]
-        if len(sub_dn) >= 3 and np.median(sub_dn["viirs_active_cells"]) > 0:
-            dn_fallbacks[dn] = (
-                float(np.median(sub_dn["modis_active_cells"]) / np.median(sub_dn["viirs_active_cells"])),
-                float(np.median(sub_dn["modis_frp_sum"]) / max(np.median(sub_dn["viirs_frp_sum"]), 1e-6)),
-                float(np.median(sub_dn["modis_raw_points"]) / max(np.median(sub_dn["viirs_raw_points"]), 1e-6)),
-            )
-        else:
+        sub_dn_pos = sub_dn[sub_dn["modis_active_cells"] > 0]
+        if (
+            len(sub_dn) >= 3
+            and np.median(sub_dn["modis_active_cells"]) > 0
+            and np.median(sub_dn["viirs_active_cells"]) > 0
+        ):
+            dn_fallbacks[dn] = _safe_median_ratios(sub_dn)
+        elif (
+            len(sub_dn_pos) >= 3
+            and np.median(sub_dn_pos["modis_active_cells"]) > 0
+            and np.median(sub_dn_pos["viirs_active_cells"]) > 0
+        ):
+            dn_fallbacks[dn] = _safe_median_ratios(sub_dn_pos)
+        elif has_global_modis:
             dn_fallbacks[dn] = (global_alpha_cells, global_alpha_frp, global_raw_ratio)
+        else:
+            d_val = default_alpha_by_dn[dn]
+            dn_fallbacks[dn] = (d_val, d_val, d_val)
 
     cal_rows: list[dict[str, object]] = []
     for month in range(1, 13):
@@ -348,18 +377,14 @@ def compute_overlap_calibration(
             slice_df = paired_valid[
                 (paired_valid["month"] == month) & (paired_valid["daynight"] == dn)
             ]
-            if len(slice_df) >= 3 and np.median(slice_df["viirs_active_cells"]) > 0:
+            if (
+                len(slice_df) >= 3
+                and np.median(slice_df["modis_active_cells"]) > 0
+                and np.median(slice_df["viirs_active_cells"]) > 0
+            ):
                 m_cells = slice_df["modis_active_cells"].to_numpy(dtype=float)
                 v_cells = slice_df["viirs_active_cells"].to_numpy(dtype=float)
-                alpha_cells = float(np.median(m_cells) / np.median(v_cells))
-                alpha_frp = float(
-                    np.median(slice_df["modis_frp_sum"])
-                    / max(np.median(slice_df["viirs_frp_sum"]), 1e-6)
-                )
-                raw_ratio = float(
-                    np.median(slice_df["modis_raw_points"])
-                    / max(np.median(slice_df["viirs_raw_points"]), 1e-6)
-                )
+                alpha_cells, alpha_frp, raw_ratio = _safe_median_ratios(slice_df)
                 ci_low, ci_high = _bootstrap_median_ratio_ci(
                     m_cells, v_cells, n_bootstrap=n_bootstrap, seed=seed + month * 10 + (1 if dn == "N" else 0)
                 )

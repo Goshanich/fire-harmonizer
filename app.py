@@ -16,7 +16,6 @@ import pandas as pd
 import plotly.graph_objects as go
 from pyproj import Geod
 import streamlit as st
-import streamlit.components.v1 as components
 
 from src.analytics import (
     MONTH_LABELS,
@@ -340,6 +339,7 @@ def _init_session_state() -> None:
 def _compact_status(status: str) -> str:
     """Shorten climatology status labels so 4-column KPI cards do not clip."""
     mapping = {
+        "Critical Anomaly (> +1.5σ)": "Крит. (> +1.5σ)",
         "Extreme Anomaly (> +1.5σ)": "Крит. (> +1.5σ)",
         "Above Normal (> P75)": "Выше нормы (>P75)",
         "Below Normal (< P25)": "Ниже нормы (<P25)",
@@ -1037,9 +1037,12 @@ def main() -> None:
     st.markdown(
         """
         <style>
-        [data-testid="stMetricLabel"] p,
-        [data-testid="stMetricDelta"] div {
-            white-space: normal;
+        [data-testid="stMetricDelta"] > div,
+        [data-testid="stMetricDelta"] div,
+        [data-testid="stMetricLabel"] p {
+            white-space: normal !important;
+            overflow: visible !important;
+            text-overflow: clip !important;
             line-height: 1.25;
         }
         </style>
@@ -1417,12 +1420,14 @@ def main() -> None:
         "Пиковый месяц",
         kpis.get("peak_month_name", "—"),
         delta=f"Медиана: {kpis.get('peak_month_median', 0):,.1f}",
+        delta_color="off",
     )
     if is_ref_mode:
         k2.metric(
             "Очагов в окне (Live)",
             f"{tm.get('live_harmonized_hotspots', 0):.1f}",
             delta=f"Сырых: {tm.get('live_raw_points', 0):.0f} · Ячеек: {tm.get('live_gridded_cells', 0):.0f}",
+            delta_color="off",
         )
     else:
         worst_frp = float(kpis.get("worst_year_frp", 0.0))
@@ -1431,17 +1436,19 @@ def main() -> None:
             "Худший год",
             str(kpis.get("worst_year", "—")),
             delta=f"{kpis.get('worst_year_hotspots', 0):,.0f} яч. · {frp_text}",
+            delta_color="off",
         )
     k3.metric(
         f"Сезон {kpis.get('focus_year', '')} ({kpis.get('focus_month_name', '')})",
         f"{kpis.get('focus_anomaly_pct', 0):+.1f}%",
-        delta=f"{_compact_status(kpis.get('focus_status', ''))} · Z={kpis.get('focus_z_score', 0):+.2f}",
+        delta=f"{kpis.get('focus_z_score', 0):+.2f}σ · {_compact_status(kpis.get('focus_status', ''))}",
         delta_color="inverse",
     )
     k4.metric(
         "Коэфф. α (VIIRS)",
         f"{tm.get('mean_alpha_overall', 1.0):.3f}",
-        delta=f"D:{tm.get('mean_alpha_day', 1.0):.2f} N:{tm.get('mean_alpha_night', 1.0):.2f} · -{tm.get('jump_reduction_pct', 0):.0f}%",
+        delta=f"-{tm.get('jump_reduction_pct', 0):.0f}% скачок · D:{tm.get('mean_alpha_day', 1.0):.2f} N:{tm.get('mean_alpha_night', 1.0):.2f}",
+        delta_color="off",
         help="Средний коэффициент приведения VIIRS (375 м) → MODIS (1 км)",
     )
 
@@ -1652,7 +1659,13 @@ def main() -> None:
             map_df = map_df[map_df["month"] == int(map_month_sel)]
 
         fmap = _build_folium_map(map_df, active_bbox, max_points=max_markers)
-        components.html(fmap.get_root().render(), height=540, scrolling=False)
+        map_html = fmap.get_root().render()
+        if hasattr(st, "iframe"):
+            st.iframe(map_html, height=540)
+        else:
+            import streamlit.components.v1 as components
+
+            components.html(map_html, height=540, scrolling=False)
 
         st.divider()
         st.subheader("📥 Экспорт гармонизированных данных (CSV)")
