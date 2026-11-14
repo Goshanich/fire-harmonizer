@@ -321,6 +321,7 @@ def _apply_bbox_to_state(bbox: tuple[float, float, float, float]) -> None:
     st.session_state["bbox_south"] = south
     st.session_state["bbox_east"] = east
     st.session_state["bbox_north"] = north
+    st.session_state["applied_bbox"] = (west, south, east, north)
 
 
 def _init_session_state() -> None:
@@ -331,6 +332,9 @@ def _init_session_state() -> None:
         st.session_state["last_preset"] = default_region
     if "bbox_west" not in st.session_state:
         _apply_bbox_to_state(REGION_PRESETS[default_region]["bbox"])
+    if "applied_bbox" not in st.session_state:
+        default_bbox = REGION_PRESETS[default_region]["bbox"]
+        st.session_state["applied_bbox"] = tuple(round(float(v), 4) for v in default_bbox)
     if "pending_bbox" in st.session_state and st.session_state["pending_bbox"] is not None:
         _apply_bbox_to_state(st.session_state.pop("pending_bbox"))
     if "api_modis_df" not in st.session_state:
@@ -959,11 +963,20 @@ class _SafeLayerControl(folium.LayerControl):
                     if (!el) return;
                     var w = el.offsetWidth;
                     if (w > 0 && w !== _lastWidth) {
+                        var firstShow = (_lastWidth === 0);
                         _lastWidth = w;
                         _map.invalidateSize(false);
-                        _map.fitBounds(_bboxBounds, {padding: [10, 10], animate: false});
-                        _map.setMaxBounds(_bboxBounds.pad(0.05));
-                        _map.setMinZoom(_map.getBoundsZoom(_bboxBounds, false));
+                        _map.options.zoomSnap = 0.1;
+                        _map.options.zoomDelta = 0.5;
+                        var minZoomForWidth = Math.max(2, Math.ceil((Math.log2(Math.max(w, 300) / 256)) * 10) / 10);
+                        _map.setMinZoom(minZoomForWidth);
+                        _map.setMaxBounds([[-85, -180], [85, 180]]);
+                        if (firstShow) {
+                            var targetZoom = Math.max(_map.getBoundsZoom(_bboxBounds, false, L.point(20, 20)), minZoomForWidth);
+                            _map.setView(_bboxBounds.getCenter(), targetZoom, {animate: false});
+                        } else if (_map.getZoom() < minZoomForWidth) {
+                            _map.setZoom(minZoomForWidth, {animate: false});
+                        }
                     }
                 };
                 if (typeof ResizeObserver !== "undefined") {
@@ -983,12 +996,6 @@ def _build_folium_map(
     west, south, east, north = bbox
     center_lat = 0.5 * (south + north)
     center_lon = 0.5 * (west + east)
-    pad_lat = max((north - south) * 0.04, 0.01)
-    pad_lon = max((east - west) * 0.04, 0.01)
-    min_lat = max(-85.0, south - pad_lat)
-    max_lat = min(85.0, north + pad_lat)
-    min_lon = max(-180.0, west - pad_lon)
-    max_lon = min(180.0, east + pad_lon)
 
     fmap = folium.Map(
         location=[center_lat, center_lon],
@@ -997,13 +1004,19 @@ def _build_folium_map(
         zoom_control=False,
         world_copy_jump=False,
         no_wrap=True,
-        min_zoom=3,
+        min_zoom=2,
         max_bounds=True,
         max_bounds_viscosity=1.0,
-        min_lat=min_lat,
-        max_lat=max_lat,
-        min_lon=min_lon,
-        max_lon=max_lon,
+        min_lat=-85.0,
+        max_lat=85.0,
+        min_lon=-180.0,
+        max_lon=180.0,
+    )
+    fmap.get_root().header.add_child(
+        folium.Element(
+            "<style>html, body { margin: 0 !important; padding: 0 !important; "
+            "width: 100% !important; height: 100% !important; overflow: hidden !important; }</style>"
+        )
     )
     folium.TileLayer(
         "OpenStreetMap",
@@ -1130,6 +1143,15 @@ def main() -> None:
             opacity: 1 !important;
             pointer-events: auto !important;
         }
+        section[data-testid="stSidebar"][aria-expanded="true"] {
+            min-width: 390px !important;
+            width: 390px !important;
+        }
+        section[data-testid="stSidebar"] [data-testid="stWidgetLabel"] p {
+            white-space: normal !important;
+            overflow: visible !important;
+            text-overflow: clip !important;
+        }
         [data-testid="stMetric"] {
             background: rgba(17, 24, 39, 0.85);
             border: 1px solid #1e293b;
@@ -1220,42 +1242,56 @@ def main() -> None:
             st.session_state["last_preset"] = region_key
             _apply_bbox_to_state(REGION_PRESETS[region_key]["bbox"])
 
-        col_w, col_s = st.columns(2)
-        west = col_w.number_input(
-            "Min Lon (West)",
-            step=0.1,
-            format="%.3f",
-            key="bbox_west",
-            help="Western longitude bound in decimal degrees (-180 to 180).",
-        )
-        south = col_s.number_input(
-            "Min Lat (South)",
-            step=0.1,
-            format="%.3f",
-            key="bbox_south",
-            help="Southern latitude bound in decimal degrees (-90 to 90).",
-        )
-        col_e, col_n = st.columns(2)
-        east = col_e.number_input(
-            "Max Lon (East)",
-            step=0.1,
-            format="%.3f",
-            key="bbox_east",
-            help="Eastern longitude bound in decimal degrees (-180 to 180).",
-        )
-        north = col_n.number_input(
-            "Max Lat (North)",
-            step=0.1,
-            format="%.3f",
-            key="bbox_north",
-            help="Northern latitude bound in decimal degrees (-90 to 90).",
-        )
+        with st.form("bbox_coords_form", border=False):
+            col_w, col_s = st.columns(2)
+            west = col_w.number_input(
+                "Min Lon (West)",
+                step=0.1,
+                format="%.3f",
+                key="bbox_west",
+                help="Western longitude bound in decimal degrees (-180 to 180).",
+            )
+            south = col_s.number_input(
+                "Min Lat (South)",
+                step=0.1,
+                format="%.3f",
+                key="bbox_south",
+                help="Southern latitude bound in decimal degrees (-90 to 90).",
+            )
+            col_e, col_n = st.columns(2)
+            east = col_e.number_input(
+                "Max Lon (East)",
+                step=0.1,
+                format="%.3f",
+                key="bbox_east",
+                help="Eastern longitude bound in decimal degrees (-180 to 180).",
+            )
+            north = col_n.number_input(
+                "Max Lat (North)",
+                step=0.1,
+                format="%.3f",
+                key="bbox_north",
+                help="Northern latitude bound in decimal degrees (-90 to 90).",
+            )
+            apply_bbox_clicked = st.form_submit_button(
+                "🎯 Apply Coordinates & Update Map",
+                type="primary",
+                width="stretch",
+            )
+
+        if apply_bbox_clicked:
+            st.session_state["applied_bbox"] = (
+                round(float(min(west, east)), 4),
+                round(float(min(south, north)), 4),
+                round(float(max(west, east)), 4),
+                round(float(max(south, north)), 4),
+            )
 
         if st.button("Reset BBox to Preset", width="stretch"):
             st.session_state["pending_bbox"] = REGION_PRESETS[region_key]["bbox"]
             st.rerun()
 
-        active_bbox = (min(west, east), min(south, north), max(west, east), max(south, north))
+        active_bbox = st.session_state["applied_bbox"]
         firms_compare_url = build_firms_map_url(active_bbox, zoom=_estimate_zoom_for_bbox(active_bbox))
 
         st.link_button(
