@@ -165,6 +165,23 @@ COLOR_PALETTES: dict[str, dict[str, str]] = {
     },
 }
 
+COLOR_SCALE_MODES: list[str] = [
+    "Robust (P95 Clamped)",
+    "Linear (Min–Max)",
+    "Logarithmic (log1p)",
+]
+
+
+def build_firms_map_url(
+    bbox: tuple[float, float, float, float],
+    zoom: int = 7,
+) -> str:
+    """Build an official NASA FIRMS interactive Fire Map deep-link centered on ``bbox``."""
+    west, south, east, north = bbox
+    center_lat = 0.5 * (south + north)
+    center_lon = 0.5 * (west + east)
+    return f"{FIRMS_MAP_URL}#d:24hrs;@{center_lon:.2f},{center_lat:.2f},{int(zoom)}z"
+
 # ---------------------------------------------------------------------------
 # Regional Presets
 # ---------------------------------------------------------------------------

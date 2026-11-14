@@ -9,7 +9,7 @@ from datetime import date, timedelta
 from typing import Any, Optional
 
 import folium
-from folium.plugins import Draw, HeatMap
+from folium.plugins import HeatMap
 from folium.template import Template
 import numpy as np
 import pandas as pd
@@ -26,6 +26,7 @@ from src.analytics import (
 )
 from src.config import (
     COLOR_PALETTES,
+    COLOR_SCALE_MODES,
     CONAE_CATALOG_OGC_URL,
     CONAE_FOCOS_URL,
     CONAE_WMS_BASE_URL,
@@ -38,6 +39,7 @@ from src.config import (
     PROCESSED_DIR,
     REGION_PRESETS,
     YEAR_RANGE,
+    build_firms_map_url,
 )
 from src.data_loader import (
     FIRMSApiClient,
@@ -56,17 +58,22 @@ st.set_page_config(
 )
 
 _GEOD = Geod(ellps="WGS84")
+PLOTLY_CONFIG: dict[str, Any] = {
+    "scrollZoom": False,
+    "displayModeBar": False,
+    "doubleClick": False,
+}
 
 
 # ---------------------------------------------------------------------------
 # Cached Data & Pipeline Helpers
 # ---------------------------------------------------------------------------
-@st.cache_data(show_spinner="Расчёт гармонизации MODIS и VIIRS...")
+@st.cache_data(show_spinner="Computing MODIS & VIIRS harmonization...")
 def _load_sample_cached(region_key: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     return generate_regional_sample_data(region_key=region_key, force=False)
 
 
-@st.cache_data(show_spinner="Расчёт гармонизации MODIS и VIIRS...")
+@st.cache_data(show_spinner="Computing MODIS & VIIRS harmonization...")
 def _run_harmonization_cached(
     modis_df: pd.DataFrame,
     viirs_df: pd.DataFrame,
@@ -106,7 +113,7 @@ def _load_regional_calibration_csv(region_key: str) -> Optional[pd.DataFrame]:
     return None
 
 
-@st.cache_data(show_spinner="Расчёт гармонизации MODIS и VIIRS...")
+@st.cache_data(show_spinner="Computing MODIS & VIIRS harmonization...")
 def _load_regional_reference_cached(
     region_key: str,
     modis_min_conf: int,
@@ -140,7 +147,7 @@ def _load_regional_reference_cached(
     return ref_result, cal_df
 
 
-@st.cache_data(show_spinner="Расчёт гармонизации MODIS и VIIRS...")
+@st.cache_data(show_spinner="Computing MODIS & VIIRS harmonization...")
 def _compute_climatology_bundle_cached(
     monthly_df: pd.DataFrame,
     gridded_df: pd.DataFrame,
@@ -174,7 +181,7 @@ def _compute_climatology_bundle_cached(
     return calendar_df, climatology_df, anomalies_df, kpis
 
 
-@st.cache_data(show_spinner="Расчёт гармонизации MODIS и VIIRS...")
+@st.cache_data(show_spinner="Computing MODIS & VIIRS harmonization...")
 def _run_preset_full_bundle_cached(
     region_key: str,
     bbox: tuple[float, float, float, float],
@@ -336,14 +343,30 @@ def _init_session_state() -> None:
         st.session_state["api_availability_attempted"] = False
 
 
+def _estimate_zoom_for_bbox(bbox: tuple[float, float, float, float]) -> int:
+    west, south, east, north = bbox
+    span = max(abs(east - west), abs(north - south), 0.05)
+    if span <= 0.6:
+        return 9
+    if span <= 1.5:
+        return 8
+    if span <= 3.5:
+        return 7
+    if span <= 7.5:
+        return 6
+    if span <= 15.0:
+        return 5
+    return 4
+
+
 def _compact_status(status: str) -> str:
     """Shorten climatology status labels so 4-column KPI cards do not clip."""
     mapping = {
-        "Critical Anomaly (> +1.5σ)": "Крит. (> +1.5σ)",
-        "Extreme Anomaly (> +1.5σ)": "Крит. (> +1.5σ)",
-        "Above Normal (> P75)": "Выше нормы (>P75)",
-        "Below Normal (< P25)": "Ниже нормы (<P25)",
-        "Normal (P25–P75)": "Норма (P25–P75)",
+        "Critical Anomaly (> +1.5σ)": "Critical (> +1.5σ)",
+        "Extreme Anomaly (> +1.5σ)": "Critical (> +1.5σ)",
+        "Above Normal (> P75)": "Above Normal (>P75)",
+        "Below Normal (< P25)": "Below Normal (<P25)",
+        "Normal (P25–P75)": "Normal (P25–P75)",
     }
     return mapping.get(status, status)
 
@@ -355,21 +378,46 @@ def _make_calendar_heatmap(
     calendar_df: pd.DataFrame,
     colorscale: str,
     metric_label: str,
+    color_scale_mode: str = "Robust (P95 Clamped)",
 ) -> go.Figure:
     years = [str(y) for y in calendar_df.index]
-    z_vals = calendar_df.to_numpy(dtype=float)
+    raw_z = calendar_df.to_numpy(dtype=float)
     show_text = len(years) <= 30
-    cb_title = "Очаги" if "очаг" in metric_label.lower() else "МВт"
-    clean_ints = np.nan_to_num(np.round(z_vals, 0), nan=0.0).astype(int).astype(str)
-    text_matrix = np.where(np.isnan(z_vals), "", clean_ints) if show_text else None
+    cb_unit = "MW" if ("frp" in metric_label.lower() or "mw" in metric_label.lower()) else "Cells"
+    clean_ints = np.nan_to_num(np.round(raw_z, 0), nan=0.0).astype(int).astype(str)
+    text_matrix = np.where(np.isnan(raw_z), "", clean_ints) if show_text else None
+
+    pos_vals = raw_z[np.isfinite(raw_z) & (raw_z > 0)]
+    if color_scale_mode == "Logarithmic (log1p)":
+        z_plot = np.where(np.isfinite(raw_z), np.log1p(np.maximum(raw_z, 0.0)), np.nan)
+        zmin: Optional[float] = 0.0
+        zmax: Optional[float] = None
+        cb_title = f"log1p({cb_unit})"
+    elif color_scale_mode == "Linear (Min–Max)":
+        z_plot = raw_z
+        zmin = None
+        zmax = None
+        cb_title = cb_unit
+    else:  # "Robust (P95 Clamped)"
+        z_plot = raw_z
+        zmin = 0.0
+        if pos_vals.size > 0:
+            p95 = float(np.nanpercentile(pos_vals, 95))
+            zmax = p95 if p95 > 0 else float(np.nanmax(pos_vals))
+        else:
+            zmax = None
+        cb_title = f"{cb_unit} (P95)"
 
     heatmap = go.Heatmap(
-        z=z_vals,
+        z=z_plot,
+        zmin=zmin,
+        zmax=zmax,
         x=list(calendar_df.columns),
         y=years,
         colorscale=colorscale,
         colorbar=dict(title=dict(text=cb_title, side="right"), thickness=14, len=0.9),
-        hovertemplate="Год: %{y}<br>Месяц: %{x}<br>" + metric_label + ": %{z:,.1f}<extra></extra>",
+        customdata=raw_z,
+        hovertemplate="Year: %{y}<br>Month: %{x}<br>" + metric_label + ": %{customdata:,.1f}<extra></extra>",
         text=text_matrix,
         texttemplate="%{text}" if show_text else None,
         textfont=dict(size=10),
@@ -377,15 +425,15 @@ def _make_calendar_heatmap(
     fig = go.Figure(data=[heatmap])
     fig.update_layout(
         title=dict(
-            text=f"Тепловой календарь активности горения (Год × Месяц) — {metric_label}",
+            text=f"Burning Activity Calendar Heatmap (Year × Month) — {metric_label}",
             font=dict(size=14),
             x=0.01,
             xanchor="left",
             y=0.96,
         ),
-        xaxis_title="Календарный месяц",
-        yaxis_title="Год",
-        yaxis=dict(autorange="reversed"),
+        dragmode=False,
+        xaxis=dict(title="Calendar Month", fixedrange=True),
+        yaxis=dict(title="Year", autorange="reversed", fixedrange=True),
         height=max(420, min(720, 26 * max(len(years), 6) + 120)),
         margin=dict(l=55, r=30, t=65, b=45),
     )
@@ -416,7 +464,7 @@ def _make_seasonal_profile_chart(
             fillcolor="rgba(100, 149, 237, 0.22)",
             line=dict(color="rgba(255,255,255,0)"),
             hoverinfo="skip",
-            name="Исторический размах (P25–P75)",
+            name="Historical IQR (P25–P75)",
         )
     )
     fig.add_trace(
@@ -425,7 +473,7 @@ def _make_seasonal_profile_chart(
             y=climatology_df["median"],
             mode="lines+markers",
             line=dict(color="#1f77b4", width=2.5, dash="dash"),
-            name="Историческая медиана",
+            name="Historical Median",
         )
     )
     if not year_df.empty:
@@ -436,20 +484,21 @@ def _make_seasonal_profile_chart(
                 mode="lines+markers",
                 line=dict(color=accent_color, width=3.5),
                 marker=dict(size=9),
-                name=f"Выбранный год ({target_year})",
+                name=f"Selected Year ({target_year})",
             )
         )
 
     fig.update_layout(
         title=dict(
-            text=f"Сезонный профиль ({target_year} г.)",
+            text=f"Seasonal Profile ({target_year} vs. Baseline)",
             font=dict(size=13),
             x=0.01,
             xanchor="left",
             y=0.96,
         ),
-        xaxis_title="Месяц",
-        yaxis_title=metric_label,
+        dragmode=False,
+        xaxis=dict(title="Month", fixedrange=True),
+        yaxis=dict(title=metric_label, fixedrange=True),
         hovermode="x unified",
         height=430,
         legend=dict(orientation="h", yanchor="top", y=-0.22, xanchor="center", x=0.5),
@@ -468,8 +517,9 @@ def _make_anomaly_bar_chart(
         .sort_values("month")
         .reset_index(drop=True)
     )
-    col = "anomaly_pct" if mode == "% отклонения от медианы" else "z_score"
-    y_title = "Отклонение от медианы, %" if mode == "% отклонения от медианы" else "Z-score (σ)"
+    is_pct_mode = mode == "% Deviation from Median"
+    col = "anomaly_pct" if is_pct_mode else "z_score"
+    y_title = "Deviation from Median (%)" if is_pct_mode else "Z-score (σ)"
 
     colors = []
     for _, row in year_df.iterrows():
@@ -495,34 +545,35 @@ def _make_anomaly_bar_chart(
                     axis=-1,
                 ),
                 hovertemplate=(
-                    "Месяц: %{x}<br>"
+                    "Month: %{x}<br>"
                     + y_title
                     + ": %{y:+.2f}<br>"
-                    + "Факт: %{customdata[0]:,.1f} | Медиана: %{customdata[1]:,.1f}<br>"
-                    + "Статус: %{customdata[2]}<extra></extra>"
+                    + "Actual: %{customdata[0]:,.1f} | Median: %{customdata[1]:,.1f}<br>"
+                    + "Status: %{customdata[2]}<extra></extra>"
                 ),
             )
         ]
     )
     fig.add_hline(y=0, line_width=1.2, line_color="#64748b")
-    if mode != "% отклонения от медианы":
+    if not is_pct_mode:
         fig.add_hline(
             y=1.5,
             line_dash="dot",
             line_color="#d62728",
-            annotation_text="Порог критической аномалии (+1.5σ)",
+            annotation_text="Critical Anomaly Threshold (+1.5σ)",
             annotation_font_color="#f8fafc",
         )
     fig.update_layout(
         title=dict(
-            text=f"Аномалии по месяцам ({target_year} г.): {mode}",
+            text=f"Monthly Fire Anomalies ({target_year}): {mode}",
             font=dict(size=13),
             x=0.01,
             xanchor="left",
             y=0.96,
         ),
-        xaxis_title="Месяц",
-        yaxis_title=y_title,
+        dragmode=False,
+        xaxis=dict(title="Month", fixedrange=True),
+        yaxis=dict(title=y_title, fixedrange=True),
         height=430,
         margin=dict(l=50, r=20, t=68, b=90),
     )
@@ -534,7 +585,7 @@ def _make_raw_vs_harmonized_chart(
     granularity: str,
     use_frp: bool,
 ) -> go.Figure:
-    if granularity == "Годовая сумма (Annual)":
+    if granularity == "Annual Total":
         df = monthly_df.groupby("year", as_index=False).sum(numeric_only=True)
         x_col = "year"
         transition_x: object = 2012
@@ -547,7 +598,7 @@ def _make_raw_vs_harmonized_chart(
     modis_col = "modis_frp_sum" if use_frp else "modis_active_cells"
     viirs_col = "viirs_frp_sum" if use_frp else "viirs_active_cells"
     harm_col = "harmonized_frp" if use_frp else "harmonized_hotspots"
-    y_title = "Мощность излучения FRP, МВт" if use_frp else "Количество очагов / точек"
+    y_title = "Fire Radiative Power (FRP, MW)" if use_frp else "Hot Spots / Detections Count"
 
     fig = go.Figure()
     if not use_frp:
@@ -556,7 +607,7 @@ def _make_raw_vs_harmonized_chart(
                 x=df[x_col],
                 y=df[raw_col],
                 mode="lines+markers",
-                name="ДО: Сырая сумма точек (MODIS + VIIRS)",
+                name="BEFORE: Raw Point Sum (MODIS + VIIRS)",
                 line=dict(color="#d62728", width=2.2, dash="dash"),
                 marker=dict(size=5),
             )
@@ -567,7 +618,7 @@ def _make_raw_vs_harmonized_chart(
                 x=df.loc[post_mask, x_col],
                 y=df.loc[post_mask, viirs_col],
                 mode="lines",
-                name="VIIRS после сетки 0.01° (без α-калибровки)",
+                name="VIIRS 0.01° Grid (Uncalibrated, without α)",
                 line=dict(color="#ff7f0e", width=2.0, dash="dot"),
             )
         )
@@ -577,7 +628,7 @@ def _make_raw_vs_harmonized_chart(
                 x=df[x_col],
                 y=df[raw_col],
                 mode="lines",
-                name="ДО: Сырая сумма FRP (MODIS + VIIRS)",
+                name="BEFORE: Raw FRP Sum (MODIS + VIIRS)",
                 line=dict(color="#d62728", width=2.2, dash="dash"),
             )
         )
@@ -587,7 +638,7 @@ def _make_raw_vs_harmonized_chart(
             x=df[x_col],
             y=df[modis_col],
             mode="lines",
-            name="Опорный ряд MODIS (1 км)",
+            name="MODIS 1 km Reference Series",
             line=dict(color="#17becf", width=2.0),
         )
     )
@@ -596,7 +647,7 @@ def _make_raw_vs_harmonized_chart(
             x=df[x_col],
             y=df[harm_col],
             mode="lines+markers",
-            name="ПОСЛЕ: Гармонизированный ряд (MODIS + α·VIIRS)",
+            name="AFTER: Harmonized Series (MODIS + α·VIIRS)",
             line=dict(color="#2ca02c", width=3.5),
             marker=dict(size=6),
         )
@@ -613,7 +664,7 @@ def _make_raw_vs_harmonized_chart(
             x=transition_x,
             y=1.02,
             yref="paper",
-            text="Запуск VIIRS (2012-03)",
+            text="VIIRS Launch (2012-03)",
             showarrow=False,
             font=dict(size=12, color="#f8fafc"),
             bgcolor="rgba(15, 23, 42, 0.82)",
@@ -623,14 +674,15 @@ def _make_raw_vs_harmonized_chart(
 
     fig.update_layout(
         title=dict(
-            text="До и После гармонизации: устранение приборного разрыва 2012 года",
+            text="Before vs. After Harmonization: Eliminating the 2012 Sensor Step Jump",
             font=dict(size=14),
             x=0.01,
             xanchor="left",
             y=0.96,
         ),
-        xaxis_title="Период",
-        yaxis_title=y_title,
+        dragmode=False,
+        xaxis=dict(title="Period", fixedrange=True),
+        yaxis=dict(title=y_title, fixedrange=True),
         hovermode="x unified",
         height=470,
         legend=dict(orientation="h", yanchor="top", y=-0.18, xanchor="center", x=0.5),
@@ -647,7 +699,12 @@ def _make_live_daily_chart(
     """Build a daily breakdown chart for short Live API / <2-year operational windows."""
     fig = go.Figure()
     if gridded_df.empty:
-        fig.update_layout(title="Оперативное окно: нет данных по датам")
+        fig.update_layout(
+            title="Operational Window: No Dated Detections",
+            dragmode=False,
+            xaxis=dict(fixedrange=True),
+            yaxis=dict(fixedrange=True),
+        )
         return fig
 
     g_daily = (
@@ -679,7 +736,7 @@ def _make_live_daily_chart(
             go.Bar(
                 x=daily["acq_date"],
                 y=daily["raw_points"],
-                name="ДО: Сырые точки",
+                name="BEFORE: Raw Detections",
                 marker_color="#d62728",
             )
         )
@@ -687,7 +744,7 @@ def _make_live_daily_chart(
             go.Bar(
                 x=daily["acq_date"],
                 y=daily["gridded_cells"],
-                name="Сетка 0.01° (без α)",
+                name="0.01° Grid (without α)",
                 marker_color="#ff7f0e",
             )
         )
@@ -695,17 +752,17 @@ def _make_live_daily_chart(
             go.Bar(
                 x=daily["acq_date"],
                 y=daily["harmonized_cells"],
-                name="ПОСЛЕ: Гармонизировано (α·VIIRS)",
+                name="AFTER: Harmonized (α·VIIRS)",
                 marker_color="#2ca02c",
             )
         )
-        y_title = "Очагов / точек за сутки"
+        y_title = "Daily Hot Spots / Detections"
     else:
         fig.add_trace(
             go.Bar(
                 x=daily["acq_date"],
                 y=daily["raw_frp"],
-                name="ДО: Сырой FRP (МВт)",
+                name="BEFORE: Raw FRP (MW)",
                 marker_color="#d62728",
             )
         )
@@ -713,22 +770,23 @@ def _make_live_daily_chart(
             go.Bar(
                 x=daily["acq_date"],
                 y=daily["harmonized_frp"],
-                name="ПОСЛЕ: Гармонизированный FRP",
+                name="AFTER: Harmonized FRP (MW)",
                 marker_color="#2ca02c",
             )
         )
-        y_title = "Мощность FRP, МВт"
+        y_title = "Fire Radiative Power (MW)"
 
     fig.update_layout(
         title=dict(
-            text="Оперативное окно (Live / <2 лет): подневная динамика гармонизации",
+            text="Operational Window (Live / <2 yrs): Daily Harmonization Dynamics",
             font=dict(size=14),
             x=0.01,
             xanchor="left",
             y=0.96,
         ),
-        xaxis_title="Дата съёмки (UTC)",
-        yaxis_title=y_title,
+        dragmode=False,
+        xaxis=dict(title="Acquisition Date (UTC)", fixedrange=True),
+        yaxis=dict(title=y_title, fixedrange=True),
         barmode="group",
         height=380,
         legend=dict(orientation="h", yanchor="top", y=-0.22, xanchor="center", x=0.5),
@@ -746,7 +804,12 @@ def _make_overlap_scatter(
     ].copy()
     fig = go.Figure()
     if valid.empty:
-        fig.update_layout(title="Недостаточно парных наблюдений (2012–2025) для корреляции")
+        fig.update_layout(
+            title="Insufficient Paired Observations (2012–2025) for Regression",
+            dragmode=False,
+            xaxis=dict(fixedrange=True),
+            yaxis=dict(fixedrange=True),
+        )
         return fig
 
     fig.add_trace(
@@ -754,17 +817,17 @@ def _make_overlap_scatter(
             x=valid["viirs_active_cells"],
             y=valid["modis_active_cells"],
             mode="markers",
-            name="Месяцы перекрытия (2012–2025)",
+            name="Overlap Months (2012–2025)",
             marker=dict(
                 size=8,
                 color=valid["year"],
                 colorscale="Viridis",
                 showscale=True,
-                colorbar=dict(title="Год", thickness=12, len=0.85),
+                colorbar=dict(title="Year", thickness=12, len=0.85),
                 opacity=0.82,
             ),
             text=[f"{int(y)}-{int(m):02d}" for y, m in zip(valid["year"], valid["month"])],
-            hovertemplate="Период: %{text}<br>VIIRS ячеек: %{x:,.0f}<br>MODIS ячеек: %{y:,.0f}<extra></extra>",
+            hovertemplate="Period: %{text}<br>VIIRS Cells: %{x:,.0f}<br>MODIS Cells: %{y:,.0f}<extra></extra>",
         )
     )
 
@@ -786,7 +849,7 @@ def _make_overlap_scatter(
     fig.update_layout(
         title=dict(
             text=(
-                f"Перекрытие (2012–2025): "
+                f"MODIS–VIIRS Overlap (2012–2025): "
                 f"R²={tm.get('overlap_r2', 0.0):.4f}, r={tm.get('overlap_pearson_r', 0.0):.4f}"
             ),
             font=dict(size=13),
@@ -794,8 +857,9 @@ def _make_overlap_scatter(
             xanchor="left",
             y=0.96,
         ),
-        xaxis_title="VIIRS активные ячейки 0.01° (шт/мес)",
-        yaxis_title="MODIS активные ячейки 0.01° (шт/мес)",
+        dragmode=False,
+        xaxis=dict(title="VIIRS Active 0.01° Cells (count/month)", fixedrange=True),
+        yaxis=dict(title="MODIS Active 0.01° Cells (count/month)", fixedrange=True),
         height=430,
         legend=dict(orientation="h", yanchor="top", y=-0.22, xanchor="center", x=0.5),
         margin=dict(l=50, r=20, t=68, b=90),
@@ -806,8 +870,8 @@ def _make_overlap_scatter(
 def _make_alpha_bar_chart(calibration_df: pd.DataFrame) -> go.Figure:
     fig = go.Figure()
     for dn, label, color in [
-        ("D", "День (D)", "#ff7f0e"),
-        ("N", "Ночь (N)", "#1f77b4"),
+        ("D", "Daytime (D)", "#ff7f0e"),
+        ("N", "Nighttime (N)", "#1f77b4"),
     ]:
         sub = calibration_df[calibration_df["daynight"] == dn].sort_values("month")
         if sub.empty:
@@ -829,14 +893,15 @@ def _make_alpha_bar_chart(calibration_df: pd.DataFrame) -> go.Figure:
 
     fig.update_layout(
         title=dict(
-            text="Коэффициенты α(m, D/N) с 95% ДИ",
+            text="Seasonal Calibration Factors α(m, D/N) with 95% Bootstrap CI",
             font=dict(size=13),
             x=0.01,
             xanchor="left",
             y=0.96,
         ),
-        xaxis_title="Месяц",
-        yaxis_title="Коэффициент приведения α",
+        dragmode=False,
+        xaxis=dict(title="Month", fixedrange=True),
+        yaxis=dict(title="Scaling Factor α (VIIRS → MODIS)", fixedrange=True),
         barmode="group",
         height=430,
         legend=dict(orientation="h", yanchor="top", y=-0.22, xanchor="center", x=0.5),
@@ -899,18 +964,6 @@ class _SafeLayerControl(folium.LayerControl):
                 }
                 window.addEventListener("resize", _refreshMapSize);
                 setInterval(_refreshMapSize, 250);
-                _map.on("draw:created", function(e) {
-                    if (e && e.layer && e.layer.getBounds) {
-                        var b = e.layer.getBounds();
-                        var sw = b.getSouthWest();
-                        var ne = b.getNorthEast();
-                        var msg = "BBox: west=" + sw.lng.toFixed(3) +
-                            ", south=" + sw.lat.toFixed(3) +
-                            ", east=" + ne.lng.toFixed(3) +
-                            ", north=" + ne.lat.toFixed(3);
-                        e.layer.bindPopup(msg).openPopup();
-                    }
-                });
             })();
         {% endmacro %}
         """
@@ -924,7 +977,26 @@ def _build_folium_map(
     center_lat = 0.5 * (south + north)
     center_lon = 0.5 * (west + east)
 
-    fmap = folium.Map(location=[center_lat, center_lon], zoom_start=7, tiles="OpenStreetMap")
+    fmap = folium.Map(
+        location=[center_lat, center_lon],
+        zoom_start=_estimate_zoom_for_bbox(bbox),
+        tiles=None,
+        zoom_control=False,
+        world_copy_jump=False,
+        no_wrap=True,
+        min_zoom=3,
+        max_bounds=True,
+        min_lat=-85,
+        max_lat=85,
+        min_lon=-180,
+        max_lon=180,
+    )
+    folium.TileLayer(
+        "OpenStreetMap",
+        name="OpenStreetMap",
+        no_wrap=True,
+        bounds=[[-85, -180], [85, 180]],
+    ).add_to(fmap)
 
     # Active Bounding Box polygon
     folium.Rectangle(
@@ -934,20 +1006,6 @@ def _build_folium_map(
         fill=True,
         fill_opacity=0.05,
         tooltip=f"Active BBox: [{west:.2f}, {south:.2f}, {east:.2f}, {north:.2f}]",
-    ).add_to(fmap)
-
-    # Drawing tool for custom user BBox selection
-    Draw(
-        export=False,
-        draw_options={
-            "polyline": False,
-            "circle": False,
-            "circlemarker": False,
-            "marker": False,
-            "polygon": True,
-            "rectangle": True,
-        },
-        edit_options={"edit": False},
     ).add_to(fmap)
 
     # External OGC WMS Layers (NASA GIBS FIRMS + CONAE Argentina)
@@ -982,8 +1040,8 @@ def _build_folium_map(
             else gridded_df
         )
 
-        modis_fg = folium.FeatureGroup(name="MODIS 1 km ячейки", show=True)
-        viirs_fg = folium.FeatureGroup(name="VIIRS 375 м → 1 km ячейки", show=True)
+        modis_fg = folium.FeatureGroup(name="MODIS 1 km Cells", show=True)
+        viirs_fg = folium.FeatureGroup(name="VIIRS 375 m → 1 km Cells", show=True)
 
         for row in sample_df.itertuples(index=False):
             is_modis = row.sensor_group == "MODIS"
@@ -991,11 +1049,11 @@ def _build_folium_map(
             color = "#0077b6" if is_modis else "#e85d04"
             radius = float(np.clip(2.5 + np.log1p(row.frp_sum) * 0.9, 3.0, 9.0))
             popup_html = (
-                f"<b>Сенсор:</b> {row.sensor_group} ({row.daynight})<br>"
-                f"<b>Дата:</b> {row.acq_date}<br>"
-                f"<b>Ячейка:</b> {row.cell_center_lat:.3f}, {row.cell_center_lon:.3f}<br>"
-                f"<b>Сырых точек в ячейке:</b> {int(row.raw_point_count)}<br>"
-                f"<b>FRP (сумма):</b> {row.frp_sum:.1f} МВт"
+                f"<b>Sensor:</b> {row.sensor_group} ({row.daynight})<br>"
+                f"<b>Date:</b> {row.acq_date}<br>"
+                f"<b>Cell Center:</b> {row.cell_center_lat:.3f}, {row.cell_center_lon:.3f}<br>"
+                f"<b>Raw Detections in Cell:</b> {int(row.raw_point_count)}<br>"
+                f"<b>FRP (Sum):</b> {row.frp_sum:.1f} MW"
             )
             folium.CircleMarker(
                 location=[row.cell_center_lat, row.cell_center_lon],
@@ -1018,7 +1076,7 @@ def _build_folium_map(
         if heat_points:
             HeatMap(
                 heat_points,
-                name="Тепловая плотность FRP",
+                name="FRP Thermal Density",
                 radius=14,
                 blur=16,
                 min_opacity=0.35,
@@ -1037,6 +1095,38 @@ def main() -> None:
     st.markdown(
         """
         <style>
+        header[data-testid="stHeader"],
+        [data-testid="stToolbar"],
+        [data-testid="stDecoration"],
+        .stAppDeployButton,
+        #MainMenu,
+        footer {
+            display: none !important;
+        }
+        [data-testid="stMetric"] {
+            background: rgba(17, 24, 39, 0.85);
+            border: 1px solid #1e293b;
+            border-radius: 10px;
+            padding: 14px 16px;
+            min-width: 200px;
+        }
+        [data-testid="stHorizontalBlock"] {
+            flex-wrap: wrap;
+        }
+        [data-testid="stColumn"],
+        [data-testid="column"] {
+            min-width: 200px !important;
+        }
+        [data-testid="stSidebar"] [data-testid="stColumn"],
+        [data-testid="stSidebar"] [data-testid="column"] {
+            min-width: 0 !important;
+        }
+        [data-testid="stMetricLabel"] p {
+            color: #cbd5e1;
+        }
+        [data-testid="stMetricValue"] {
+            color: #f8fafc;
+        }
         [data-testid="stMetricDelta"] > div,
         [data-testid="stMetricDelta"] div,
         [data-testid="stMetricLabel"] p {
@@ -1053,66 +1143,123 @@ def main() -> None:
     st.title("🔥 MODIS & VIIRS Hot Spots Harmonizer — Burning Activity Calendar")
     st.caption(
         "NASA Space Apps Challenge 2026 (NASA & CONAE) · "
-        "Устранение приборного разрыва 2012 г. между MODIS (1 км) и VIIRS (375 м) "
-        "с формированием согласованного ряда 2001–2026 гг."
+        "Removing the 2012 MODIS (1 km) → VIIRS (375 m) sensor discontinuity to produce "
+        "a seamless, climatology-ready 2001–2026 fire record."
     )
+
+    with st.expander(
+        "📖 What do these metrics mean? (Quick Guide to FRP, α, Z-score & 0.01° Grid)",
+        expanded=False,
+    ):
+        st.markdown(
+            """
+- **Active Fire Cell (`0.01° × 0.01° ≈ 1 km²`)**: VIIRS (`375 m`) resolves sub-pixel fire clusters that MODIS (`1 km`) reports as a single hotspot, inflating raw detection counts by ~7–9× after March 2012. Gridding merges co-located detections within each `0.01°` grid cell per sensor and overpass (`Day`/`Night`) onto a standardized 1 km scale.
+- **FRP (Fire Radiative Power, MW)**: Instantaneous radiative heat release measured in megawatts (`MW`). Total FRP reflects fire intensity and fuel consumption rate rather than raw pixel counts.
+- **Calibration Factor `α` (VIIRS → MODIS)**: Monthly day/night ratio derived from the `2012–2025` MODIS–VIIRS overlap period (`Day ~0.85`, `Night ~0.36`). Nighttime `α` is lower because VIIRS detects cooler, smaller nighttime smoldering fires invisible to MODIS at `1 km`.
+- **Z-score (`σ`) & IQR (`P25–P75`)**: Historical climatology (`2001–2025`) defines normal seasonal activity (`P25–P75` interquartile band). Values above `P75` are **Above Normal**, values below `P25` are **Below Normal**, and `Z > +1.5σ` flags a **Critical Anomaly**.
+            """
+        )
 
     # -----------------------------------------------------------------------
     # Sidebar Controls
     # -----------------------------------------------------------------------
     with st.sidebar:
-        st.header("⚙️ Панель управления")
+        st.header("⚙️ Control Panel")
 
         source_mode = st.radio(
-            "Источник данных",
+            "Data Source",
             options=[
-                "Демо-архив (2001–2026, офлайн)",
-                "Загрузка CSV (FIRMS Archive)",
-                "Живой запрос NASA FIRMS Area API",
+                "Preset Archive (2001–2026, Offline)",
+                "Upload CSV (FIRMS Archive)",
+                "Live NASA FIRMS Area API",
             ],
             index=0,
+            help=(
+                "Choose preloaded 2001–2026 regional archives, upload your own MODIS/VIIRS CSVs "
+                "from FIRMS Archive Download, or query live NRT detections via the FIRMS Area API."
+            ),
         )
 
-        st.subheader("🌍 Регион и Bounding Box")
+        st.subheader("🌍 Region & Bounding Box")
         preset_keys = list(REGION_PRESETS.keys())
         region_key = st.selectbox(
-            "Пресет региона",
+            "Region Preset",
             options=preset_keys,
-            format_func=lambda k: REGION_PRESETS[k]["name_ru"],
+            format_func=lambda k: REGION_PRESETS[k]["name"],
             key="selected_region",
+            help="Select a benchmark fire-monitoring region (Córdoba/CONAE, Ukraine, or California).",
         )
         if region_key != st.session_state["last_preset"]:
             st.session_state["last_preset"] = region_key
             _apply_bbox_to_state(REGION_PRESETS[region_key]["bbox"])
 
         col_w, col_s = st.columns(2)
-        west = col_w.number_input("Min Lon (West)", step=0.1, format="%.3f", key="bbox_west")
-        south = col_s.number_input("Min Lat (South)", step=0.1, format="%.3f", key="bbox_south")
+        west = col_w.number_input(
+            "Min Lon (West)",
+            step=0.1,
+            format="%.3f",
+            key="bbox_west",
+            help="Western longitude bound in decimal degrees (-180 to 180).",
+        )
+        south = col_s.number_input(
+            "Min Lat (South)",
+            step=0.1,
+            format="%.3f",
+            key="bbox_south",
+            help="Southern latitude bound in decimal degrees (-90 to 90).",
+        )
         col_e, col_n = st.columns(2)
-        east = col_e.number_input("Max Lon (East)", step=0.1, format="%.3f", key="bbox_east")
-        north = col_n.number_input("Max Lat (North)", step=0.1, format="%.3f", key="bbox_north")
+        east = col_e.number_input(
+            "Max Lon (East)",
+            step=0.1,
+            format="%.3f",
+            key="bbox_east",
+            help="Eastern longitude bound in decimal degrees (-180 to 180).",
+        )
+        north = col_n.number_input(
+            "Max Lat (North)",
+            step=0.1,
+            format="%.3f",
+            key="bbox_north",
+            help="Northern latitude bound in decimal degrees (-90 to 90).",
+        )
 
-        if st.button("Сбросить BBox к пресету", width="stretch"):
+        if st.button("Reset BBox to Preset", width="stretch"):
             st.session_state["pending_bbox"] = REGION_PRESETS[region_key]["bbox"]
             st.rerun()
 
         active_bbox = (min(west, east), min(south, north), max(west, east), max(south, north))
+        firms_compare_url = build_firms_map_url(active_bbox, zoom=_estimate_zoom_for_bbox(active_bbox))
+
+        st.link_button(
+            "🌐 Compare in Official NASA FIRMS Fire Map",
+            firms_compare_url,
+            width="stretch",
+            help="Open the current Bounding Box center on NASA's official FIRMS Global Fire Map.",
+        )
+        st.link_button(
+            "🛰️ Open Official CONAE Geoportal",
+            CONAE_FOCOS_URL,
+            width="stretch",
+            help="Inspect Argentina's official CONAE Focos de Calor portal and OGC catalog.",
+        )
 
         # Source-specific input widgets
         uploaded_files = None
-        if source_mode == "Загрузка CSV (FIRMS Archive)":
+        if source_mode == "Upload CSV (FIRMS Archive)":
             st.info(
-                f"Загрузите CSV из [FIRMS Archive Download]({FIRMS_ARCHIVE_URL}) "
-                "(MODIS и/или VIIRS)."
+                f"Upload CSV exports from [FIRMS Archive Download]({FIRMS_ARCHIVE_URL}) "
+                "(MODIS and/or VIIRS)."
             )
             uploaded_files = st.file_uploader(
-                "Выберите CSV-файлы FIRMS",
+                "Select FIRMS CSV files",
                 type=["csv"],
                 accept_multiple_files=True,
+                help="Supports standard FIRMS MODIS (brightness/confidence 0–100) and VIIRS (l/n/h) CSV files.",
             )
 
-        elif source_mode == "Живой запрос NASA FIRMS Area API":
-            st.info(f"Получите бесплатный MAP_KEY на [FIRMS Map Key]({FIRMS_MAP_KEY_URL}).")
+        elif source_mode == "Live NASA FIRMS Area API":
+            st.info(f"Get a free MAP_KEY from [FIRMS Map Key]({FIRMS_MAP_KEY_URL}).")
             default_key = ""
             try:
                 default_key = str(st.secrets.get("FIRMS_MAP_KEY", "") or "").strip()
@@ -1124,7 +1271,12 @@ def main() -> None:
                     default_key = client_env.map_key
                 except Exception:
                     default_key = ""
-            api_key_input = st.text_input("FIRMS MAP_KEY", value=default_key, type="password")
+            api_key_input = st.text_input(
+                "FIRMS MAP_KEY",
+                value=default_key,
+                type="password",
+                help="Loaded automatically from Streamlit Secrets or local .env when configured.",
+            )
             api_client = FIRMSApiClient(map_key=api_key_input)
 
             if (
@@ -1139,23 +1291,29 @@ def main() -> None:
                 except FIRMSApiError:
                     pass
 
-            if st.button("Проверить покрытие API (Data Availability)", width="stretch"):
+            if st.button("Check API Coverage (Data Availability)", width="stretch"):
                 try:
                     avail_df = api_client.check_data_availability("ALL")
                     st.session_state["api_availability_df"] = avail_df
-                    st.success(f"Подключение подтверждено ({len(avail_df)} сенсоров).")
+                    st.success(f"Connection verified ({len(avail_df)} sensors available).")
                 except FIRMSApiError as exc:
                     st.error(str(exc))
 
             if not st.session_state["api_availability_df"].empty:
-                with st.expander("Доступность сенсоров FIRMS"):
+                with st.expander("FIRMS Sensor Availability"):
                     st.dataframe(st.session_state["api_availability_df"], hide_index=True)
 
-            api_modis_src = st.selectbox("Источник MODIS", ["MODIS_NRT", "MODIS_SP"], index=0)
+            api_modis_src = st.selectbox(
+                "MODIS Source",
+                ["MODIS_NRT", "MODIS_SP"],
+                index=0,
+                help="Select MODIS Near Real-Time (NRT) or Standard Processing (SP) archive stream.",
+            )
             api_viirs_src = st.selectbox(
-                "Источник VIIRS",
+                "VIIRS Source",
                 ["VIIRS_NOAA20_NRT", "VIIRS_SNPP_NRT", "VIIRS_NOAA20_SP", "VIIRS_SNPP_SP"],
                 index=0,
+                help="Select VIIRS NOAA-20 or Suomi NPP NRT/SP stream.",
             )
 
             per_src_bounds, common_min_dt, common_max_dt = _get_sensor_date_bounds(
@@ -1167,23 +1325,30 @@ def main() -> None:
                     f"`{src}`: {b[0].isoformat()}..{b[1].isoformat()}"
                     for src, b in per_src_bounds.items()
                 )
-                st.caption(f"Доступный диапазон FIRMS: {bounds_text}")
+                st.caption(f"Available FIRMS range: {bounds_text}")
 
-            api_days = st.slider("Период (дней, чанки по 10)", min_value=1, max_value=30, value=5)
+            api_days = st.slider(
+                "Window Length (days, 10-day chunks)",
+                min_value=1,
+                max_value=30,
+                value=5,
+                help="FIRMS Area API serves up to 10 days per call; longer windows are fetched in chunks.",
+            )
             api_end_default = common_max_dt or date.today()
             api_start_default = api_end_default - timedelta(days=int(api_days) - 1)
             if common_min_dt and api_start_default < common_min_dt:
                 api_start_default = common_min_dt
 
             api_start_date = st.date_input(
-                "Дата начала выборки",
+                "Sample Start Date",
                 value=api_start_default,
                 min_value=common_min_dt,
                 max_value=common_max_dt or date.today(),
                 key=f"api_start_{api_modis_src}_{api_viirs_src}",
+                help="First UTC acquisition date to query from NASA LANCE FIRMS.",
             )
 
-            if st.button("Загрузить данные через FIRMS API", type="primary", width="stretch"):
+            if st.button("Fetch Data via FIRMS API", type="primary", width="stretch"):
                 try:
                     req_end = api_start_date + timedelta(days=int(api_days) - 1)
                     m_max = per_src_bounds.get(api_modis_src, (None, req_end))[1] or req_end
@@ -1193,7 +1358,7 @@ def main() -> None:
                     m_start = min(api_start_date, m_end)
                     v_start = min(api_start_date, v_end)
 
-                    with st.spinner("Загрузка данных из NASA LANCE FIRMS..."):
+                    with st.spinner("Fetching detections from NASA LANCE FIRMS..."):
                         m_api = api_client.fetch_area_range(
                             source=api_modis_src,
                             bbox=active_bbox,
@@ -1209,73 +1374,80 @@ def main() -> None:
                     st.session_state["api_modis_df"] = m_api
                     st.session_state["api_viirs_df"] = v_api
                     st.success(
-                        f"Загружено: MODIS={len(m_api)}, VIIRS={len(v_api)} точек "
+                        f"Loaded: MODIS={len(m_api)}, VIIRS={len(v_api)} detections "
                         f"({m_start.isoformat()}..{max(m_end, v_end).isoformat()})."
                     )
                 except FIRMSApiError as exc:
                     st.error(str(exc))
 
-        st.subheader("🔬 Фильтры и калибровка")
+        st.subheader("🔬 Filters & Calibration")
         year_min, year_max = st.slider(
-            "Диапазон лет",
+            "Year Range",
             min_value=YEAR_RANGE[0],
             max_value=YEAR_RANGE[1],
             value=YEAR_RANGE,
+            help="Restrict analysis to a subset of years (baseline climatology uses 2001–2025 when available).",
         )
         daynight_option = st.selectbox(
-            "Время суток пролёта (daynight)",
+            "Overpass Time (daynight)",
             options=["All", "D", "N"],
-            format_func=lambda x: {"All": "Все (День + Ночь)", "D": "Только день (D)", "N": "Только ночь (N)"}[x],
+            format_func=lambda x: {"All": "All (Day + Night)", "D": "Daytime only (D)", "N": "Nighttime only (N)"}[x],
+            help="Filter detections by daytime (D) or nighttime (N) satellite overpass.",
         )
         modis_min_conf = st.slider(
-            "Мин. достоверность MODIS (0–100)",
+            "Min MODIS Confidence (0–100)",
             min_value=0,
             max_value=100,
             value=DEFAULT_MODIS_MIN_CONFIDENCE,
             step=5,
+            help="Minimum FIRMS MODIS detection confidence (%) required to keep a fire pixel.",
         )
         viirs_conf = st.multiselect(
-            "Допустимая достоверность VIIRS",
+            "Allowed VIIRS Confidence",
             options=["l", "n", "h"],
             default=DEFAULT_VIIRS_CONFIDENCE,
+            help="VIIRS confidence categories: l (low), n (nominal), h (high).",
         )
         combo_mode = st.selectbox(
-            "Режим сшивки после 2012 г.",
+            "Post-2012 Stitching Mode",
             options=["calibrated_viirs", "ensemble"],
             format_func=lambda m: (
-                "Откалиброванный VIIRS × α (бесшовное продление)"
+                "Calibrated VIIRS × α (seamless extension)"
                 if m == "calibrated_viirs"
-                else "Ансамбль (MODIS + VIIRS × α) / 2"
+                else "Ensemble (MODIS + VIIRS × α) / 2"
             ),
+            help="Choose how post-2012 series are built: MODIS before 2012-03 + α-scaled VIIRS, or 50/50 ensemble.",
         )
         metric_choice = st.radio(
-            "Показатель календаря",
+            "Calendar Metric",
             options=["harmonized_hotspots", "harmonized_frp"],
             format_func=lambda m: (
-                "Гармонизированные очаги (ячейки 1 км)"
+                "Harmonized Hot Spots (1 km cells)"
                 if m == "harmonized_hotspots"
-                else "Мощность излучения FRP (МВт)"
+                else "Fire Radiative Power (FRP, MW)"
             ),
+            help="Switch all charts and KPIs between harmonized 1 km fire cell counts and radiative power (MW).",
         )
         palette_name = st.selectbox(
-            "Цветовая палитра (CVD-friendly)",
+            "Color Palette (CVD-Friendly)",
             options=list(COLOR_PALETTES.keys()),
             format_func=lambda p: COLOR_PALETTES[p]["label"],
+            help="Perceptually uniform, colorblind-safe colorscales for the heatmap and seasonal plots.",
         )
 
     # -----------------------------------------------------------------------
     # Load Selected Data Source & Execute Cached Harmonization + Climatology
     # -----------------------------------------------------------------------
     if not viirs_conf:
-        st.warning("Выберите хотя бы одну категорию достоверности VIIRS (`n`, `h` или `l`).")
+        st.warning("Select at least one VIIRS confidence level (`l`, `n`, or `h`).")
         st.stop()
 
     start_date_str = f"{year_min:04d}-01-01"
     end_date_str = f"{year_max:04d}-12-31"
     viirs_conf_tuple = tuple(sorted(viirs_conf))
 
-    if source_mode == "Демо-архив (2001–2026, офлайн)":
-        active_region_label = REGION_PRESETS[region_key]["name_ru"]
+    if source_mode == "Preset Archive (2001–2026, Offline)":
+        active_region_label = REGION_PRESETS[region_key]["name"]
         (
             modis_count,
             viirs_count,
@@ -1298,27 +1470,27 @@ def main() -> None:
         )
         if result.monthly_df.empty:
             st.warning(
-                "В выбранном регионе и диапазоне дат не найдено очагов, прошедших фильтры достоверности. "
-                "Попробуйте расширить Bounding Box, диапазон лет или снизить порог confidence."
+                "No detections matched the selected region, date range, and confidence filters. "
+                "Try expanding the Bounding Box, widening the year range, or lowering confidence thresholds."
             )
             st.stop()
     else:
-        if source_mode == "Загрузка CSV (FIRMS Archive)":
+        if source_mode == "Upload CSV (FIRMS Archive)":
             if not uploaded_files:
-                st.warning("Загрузите один или несколько CSV-файлов MODIS/VIIRS в боковой панели, чтобы начать расчёт.")
+                st.warning("Upload one or more MODIS/VIIRS CSV files in the sidebar to run harmonization.")
                 st.stop()
             raw_modis_df, raw_viirs_df = load_csv_dataset(uploaded_files)
-            active_region_label = "Пользовательский CSV-архив FIRMS"
+            active_region_label = "Custom FIRMS CSV Archive"
         else:
             raw_modis_df = st.session_state["api_modis_df"]
             raw_viirs_df = st.session_state["api_viirs_df"]
             if raw_modis_df.empty and raw_viirs_df.empty:
                 st.info(
-                    "Нажмите **«Загрузить данные через FIRMS API»** в боковой панели, чтобы получить "
-                    "актуальные данные NASA FIRMS по выбранному региону, или переключитесь на демо-архив."
+                    "Click **Fetch Data via FIRMS API** in the sidebar to load near real-time "
+                    "NASA FIRMS detections for the selected Bounding Box, or switch to a Preset Archive."
                 )
                 st.stop()
-            active_region_label = f"Живой API FIRMS ({REGION_PRESETS[region_key]['name_ru']})"
+            active_region_label = f"Live FIRMS API ({REGION_PRESETS[region_key]['name']})"
 
         modis_filtered = filter_by_bbox_and_dates(
             raw_modis_df,
@@ -1346,7 +1518,7 @@ def main() -> None:
         )
         unique_years_count = int(all_dates.astype(str).str[:4].nunique()) if not all_dates.empty else 0
         needs_reference_cal = (
-            source_mode == "Живой запрос NASA FIRMS Area API"
+            source_mode == "Live NASA FIRMS Area API"
             or unique_years_count < 2
         )
 
@@ -1379,8 +1551,8 @@ def main() -> None:
 
         if result.monthly_df.empty:
             st.warning(
-                "В выбранном регионе и диапазоне дат не найдено очагов, прошедших фильтры достоверности. "
-                "Попробуйте расширить Bounding Box, диапазон лет или снизить порог confidence."
+                "No detections matched the selected region, date range, and confidence filters. "
+                "Try expanding the Bounding Box, widening the year range, or lowering confidence thresholds."
             )
             st.stop()
 
@@ -1393,23 +1565,23 @@ def main() -> None:
         )
 
     use_frp = metric_choice == "harmonized_frp"
-    metric_label = "Гармонизированный FRP (МВт)" if use_frp else "Гармонизированные очаги (ячейки 1 км)"
+    metric_label = "Harmonized FRP (MW)" if use_frp else "Harmonized Hot Spots (1 km cells)"
     tm = result.transition_metrics
     is_ref_mode = bool(tm.get("used_reference_calibration", False))
 
     area_km2 = _compute_bbox_area_km2(active_bbox)
     st.markdown(
-        f"**Регион:** {active_region_label} · **Площадь BBox:** {area_km2:,.0f} км² · "
-        f"**Точек после фильтрации:** MODIS `{modis_count:,}` | VIIRS `{viirs_count:,}`"
+        f"**Region:** {active_region_label} · **BBox Area:** {area_km2:,.0f} km² · "
+        f"**Filtered Detections:** MODIS `{modis_count:,}` | VIIRS `{viirs_count:,}`"
     )
     if is_ref_mode:
         st.info(
-            f"ℹ️ **Режим оперативного мониторинга (< 2 лет / NASA FIRMS NRT API):** "
-            f"применены предрассчитанные региональные коэффициенты `α(m, daynight)` из "
-            f"`data/processed/calibration_alpha_{region_key}.csv` и опорная климатология 2001–2025 гг. "
-            f"(в текущем окне: `{tm.get('live_raw_points', 0):.0f}` сырых точек → "
-            f"`{tm.get('live_gridded_cells', 0):.0f}` ячеек 0.01° → "
-            f"`{tm.get('live_harmonized_hotspots', 0):.1f}` гармонизированных очагов)."
+            f"ℹ️ **Operational Monitoring Mode (< 2 years / NASA FIRMS NRT API):** "
+            f"applying pre-computed regional calibration factors `α(m, daynight)` from "
+            f"`data/processed/calibration_alpha_{region_key}.csv` and the 2001–2025 baseline climatology "
+            f"(active window: `{tm.get('live_raw_points', 0):.0f}` raw detections → "
+            f"`{tm.get('live_gridded_cells', 0):.0f}` 0.01° cells → "
+            f"`{tm.get('live_harmonized_hotspots', 0):.1f}` harmonized hotspots)."
         )
 
     # -----------------------------------------------------------------------
@@ -1417,39 +1589,43 @@ def main() -> None:
     # -----------------------------------------------------------------------
     k1, k2, k3, k4 = st.columns(4)
     k1.metric(
-        "Пиковый месяц",
+        "Peak Fire Month",
         kpis.get("peak_month_name", "—"),
-        delta=f"Медиана: {kpis.get('peak_month_median', 0):,.1f}",
+        delta=f"Median: {kpis.get('peak_month_median', 0):,.1f}",
         delta_color="off",
+        help="Calendar month with the highest 2001–2025 historical median fire activity.",
     )
     if is_ref_mode:
         k2.metric(
-            "Очагов в окне (Live)",
+            "Window Hot Spots (Live)",
             f"{tm.get('live_harmonized_hotspots', 0):.1f}",
-            delta=f"Сырых: {tm.get('live_raw_points', 0):.0f} · Ячеек: {tm.get('live_gridded_cells', 0):.0f}",
+            delta=f"Raw: {tm.get('live_raw_points', 0):.0f} · Cells: {tm.get('live_gridded_cells', 0):.0f}",
             delta_color="off",
+            help="Total α-calibrated 1 km fire hotspots detected within the active operational window.",
         )
     else:
         worst_frp = float(kpis.get("worst_year_frp", 0.0))
-        frp_text = f"{worst_frp / 1000.0:.1f} ГВт" if worst_frp >= 1000.0 else f"{worst_frp:,.0f} МВт"
+        frp_text = f"{worst_frp / 1000.0:.1f} GW" if worst_frp >= 1000.0 else f"{worst_frp:,.0f} MW"
         k2.metric(
-            "Худший год",
+            "Peak Wildfire Year",
             str(kpis.get("worst_year", "—")),
-            delta=f"{kpis.get('worst_year_hotspots', 0):,.0f} яч. · {frp_text}",
+            delta=f"{kpis.get('worst_year_hotspots', 0):,.0f} cells · {frp_text}",
             delta_color="off",
+            help="Year with the highest cumulative harmonized fire activity (hotspots & total FRP) in the selected range.",
         )
     k3.metric(
-        f"Сезон {kpis.get('focus_year', '')} ({kpis.get('focus_month_name', '')})",
+        f"Season {kpis.get('focus_year', '')} ({kpis.get('focus_month_name', '')})",
         f"{kpis.get('focus_anomaly_pct', 0):+.1f}%",
         delta=f"{kpis.get('focus_z_score', 0):+.2f}σ · {_compact_status(kpis.get('focus_status', ''))}",
         delta_color="inverse",
+        help="Percentage departure and standardized Z-score (σ) vs. the 2001–2025 monthly climatological baseline.",
     )
     k4.metric(
-        "Коэфф. α (VIIRS)",
+        "Calibration α (VIIRS)",
         f"{tm.get('mean_alpha_overall', 1.0):.3f}",
-        delta=f"-{tm.get('jump_reduction_pct', 0):.0f}% скачок · D:{tm.get('mean_alpha_day', 1.0):.2f} N:{tm.get('mean_alpha_night', 1.0):.2f}",
+        delta=f"-{tm.get('jump_reduction_pct', 0):.0f}% jump · D:{tm.get('mean_alpha_day', 1.0):.2f} N:{tm.get('mean_alpha_night', 1.0):.2f}",
         delta_color="off",
-        help="Средний коэффициент приведения VIIRS (375 м) → MODIS (1 км)",
+        help="Mean VIIRS (375 m) → MODIS (1 km) scaling coefficient across daytime (D) and nighttime (N) overpasses.",
     )
 
     # -----------------------------------------------------------------------
@@ -1457,21 +1633,34 @@ def main() -> None:
     # -----------------------------------------------------------------------
     tab1, tab2, tab3 = st.tabs(
         [
-            "📅 Календарь активности горения",
-            "📊 Доказательство гармонизации (Raw vs Harmonized)",
-            "🗺️ Карта очагов и экспорт CSV",
+            "📅 Burning Activity Calendar",
+            "📊 Harmonization Proof (Raw vs. Harmonized)",
+            "🗺️ Geospatial Explorer & CSV Export",
         ]
     )
 
     # === TAB 1: BURNING ACTIVITY CALENDAR ===
     with tab1:
+        color_scale_mode = st.radio(
+            "Color Scale Mode",
+            options=COLOR_SCALE_MODES,
+            index=0,
+            horizontal=True,
+            help=(
+                "Robust (P95 Clamped) caps the heatmap color limit at the 95th percentile of active months "
+                "so 1–2 extreme mega-fire seasons do not wash out normal seasonal patterns. "
+                "Cell text and hover tooltips always show exact real values."
+            ),
+        )
         st.plotly_chart(
             _make_calendar_heatmap(
                 calendar_df=calendar_df,
                 colorscale=COLOR_PALETTES[palette_name]["plotly"],
                 metric_label=metric_label,
+                color_scale_mode=color_scale_mode,
             ),
             width="stretch",
+            config=PLOTLY_CONFIG,
         )
 
         available_years = sorted(anomalies_df["year"].unique().tolist(), reverse=True)
@@ -1482,15 +1671,17 @@ def main() -> None:
         c_left, c_right = st.columns([1, 2])
         with c_left:
             selected_year = st.selectbox(
-                "Год для сравнения с исторической нормой",
+                "Comparison Year vs. Baseline",
                 options=available_years,
                 index=available_years.index(default_cmp_year),
+                help="Select a year to plot against the 2001–2025 median and P25–P75 interquartile band.",
             )
         with c_right:
             anom_metric_mode = st.radio(
-                "Метрика аномалии",
-                options=["% отклонения от медианы", "Z-score (σ)"],
+                "Anomaly Metric",
+                options=["% Deviation from Median", "Z-score (σ)"],
                 horizontal=True,
+                help="View monthly departures as percentage above/below historical median or standardized σ units.",
             )
 
         p_col1, p_col2 = st.columns(2)
@@ -1504,6 +1695,7 @@ def main() -> None:
                     accent_color=COLOR_PALETTES[palette_name]["accent"],
                 ),
                 width="stretch",
+                config=PLOTLY_CONFIG,
             )
         with p_col2:
             st.plotly_chart(
@@ -1513,9 +1705,10 @@ def main() -> None:
                     mode=anom_metric_mode,
                 ),
                 width="stretch",
+                config=PLOTLY_CONFIG,
             )
 
-        with st.expander(f"Детальная таблица аномалий за {selected_year} год"):
+        with st.expander(f"Detailed Monthly Anomaly Table for {selected_year}"):
             year_table = anomalies_df[anomalies_df["year"] == selected_year][
                 [
                     "date_label",
@@ -1532,17 +1725,17 @@ def main() -> None:
                 ]
             ].rename(
                 columns={
-                    "date_label": "Период",
-                    "month_name": "Месяц",
-                    "value": "Гармонизировано",
-                    "median": "Медиана (2001–2025)",
+                    "date_label": "Period",
+                    "month_name": "Month",
+                    "value": "Harmonized",
+                    "median": "Median (2001–2025)",
                     "p25": "P25",
                     "p75": "P75",
-                    "anomaly_abs": "Отклонение (абс.)",
-                    "anomaly_pct": "Отклонение (%)",
+                    "anomaly_abs": "Deviation (Abs.)",
+                    "anomaly_pct": "Deviation (%)",
                     "z_score": "Z-score",
-                    "anomaly_status": "Статус",
-                    "primary_source": "Источник ряда",
+                    "anomaly_status": "Status",
+                    "primary_source": "Series Source",
                 }
             )
             st.dataframe(year_table, hide_index=True, width="stretch")
@@ -1557,15 +1750,17 @@ def main() -> None:
                     harmonized_cells_df=result.harmonized_cells_df,
                 ),
                 width="stretch",
+                config=PLOTLY_CONFIG,
             )
             proof_monthly_df = ref_result.monthly_df
         else:
             proof_monthly_df = result.monthly_df
 
         granularity = st.radio(
-            "Детализация временного ряда",
-            options=["Годовая сумма (Annual)", "Помесячный ряд (Monthly)"],
+            "Time Series Granularity",
+            options=["Annual Total", "Monthly Series"],
             horizontal=True,
+            help="Toggle between annual sums and full monthly resolution across the 2012 VIIRS transition.",
         )
         st.plotly_chart(
             _make_raw_vs_harmonized_chart(
@@ -1574,37 +1769,44 @@ def main() -> None:
                 use_frp=use_frp,
             ),
             width="stretch",
+            config=PLOTLY_CONFIG,
         )
 
         if is_ref_mode:
             st.caption(
-                f"Метрики разрыва 2012 г. и корреляция перекрытия ниже приведены по опорному "
-                f"архиву региона `{REGION_PRESETS[region_key]['name_ru']}` (2001–2026), так как "
-                f"активная выборка охватывает менее 2 лет и калибруется по `calibration_alpha_{region_key}.csv`."
+                f"2012 transition diagnostics and overlap R² below reflect the reference archive for "
+                f"`{REGION_PRESETS[region_key]['name']}` (2001–2026), as the active window spans < 2 years "
+                f"and uses pre-calibrated `calibration_alpha_{region_key}.csv`."
             )
 
         m1, m2, m3, m4 = st.columns(4)
         m1.metric(
-            "Сырой скачок после 2012 г.",
+            "Raw Post-2012 Step Jump",
             f"{tm.get('raw_combined_jump_pct', 0):+.1f}%",
-            delta=f"{tm.get('pre2012_raw_annual_mean', 0):,.0f} → {tm.get('post2012_raw_combined_annual_mean', 0):,.0f} точек/год",
+            delta=f"{tm.get('pre2012_raw_annual_mean', 0):,.0f} → {tm.get('post2012_raw_combined_annual_mean', 0):,.0f} pts/yr",
             delta_color="inverse",
+            help="Artificial inflation in raw point counts between 2001–2011 (MODIS) and 2013–2026 (MODIS + VIIRS).",
         )
         m2.metric(
-            "Сетка 0.01° без α",
+            "0.01° Grid Without α",
             f"{tm.get('gridded_uncalibrated_jump_pct', 0):+.1f}%",
-            delta=f"{tm.get('pre2012_gridded_annual_mean', 0):,.0f} → {tm.get('post2012_gridded_viirs_annual_mean', 0):,.0f} ячеек/год",
+            delta=f"{tm.get('pre2012_gridded_annual_mean', 0):,.0f} → {tm.get('post2012_gridded_viirs_annual_mean', 0):,.0f} cells/yr",
             delta_color="inverse",
+            help="Residual discontinuity remaining after 0.01° spatial gridding alone, before α scaling.",
         )
         m3.metric(
-            "Остаточный сдвиг сенсоров (2012–2025)",
+            "Residual Sensor Bias (2012–2025)",
             f"{tm.get('overlap_sensor_residual_bias_pct', 0):+.2f}%",
-            delta="VIIRS·α vs MODIS на перекрытии",
+            delta="VIIRS·α vs. MODIS overlap",
+            delta_color="off",
+            help="Mean relative difference between calibrated VIIRS·α and MODIS 1 km during the 2012–2025 overlap.",
         )
         m4.metric(
-            "Подавление скачка 2012",
+            "2012 Jump Suppression",
             f"{tm.get('jump_reduction_pct', 0):.2f}%",
             delta=f"Overlap R² = {tm.get('overlap_r2', 0):.4f}",
+            delta_color="off",
+            help="Fraction of the artificial 2012 sensor step-jump eliminated by the 4-stage pipeline, plus overlap R².",
         )
 
         s_col1, s_col2 = st.columns(2)
@@ -1612,27 +1814,41 @@ def main() -> None:
             st.plotly_chart(
                 _make_overlap_scatter(result.overlap_monthly_df, tm),
                 width="stretch",
+                config=PLOTLY_CONFIG,
             )
         with s_col2:
             st.plotly_chart(
                 _make_alpha_bar_chart(result.calibration_df),
                 width="stretch",
+                config=PLOTLY_CONFIG,
             )
 
-        with st.expander("Таблица калибровочных коэффициентов α(m, daynight) и 95% ДИ (бутстрап)"):
+        with st.expander("Monthly & Day/Night Calibration Table α(m, daynight) & 95% Bootstrap CI"):
             st.dataframe(result.calibration_df, hide_index=True, width="stretch")
 
     # === TAB 3: GEOSPATIAL EXPLORER & CSV EXPORT ===
     with tab3:
         st.markdown(
-            f"На карте можно рисовать прямоугольник или полигон инструментом **Draw** слева "
-            f"(клик по фигуре покажет координаты BBox), включать внешние слои OGC WMS "
-            f"([CONAE]({CONAE_CATALOG_OGC_URL}), [CONAE Focos]({CONAE_FOCOS_URL}), "
+            f"Inspect harmonized 0.01° cells alongside external OGC WMS overlays "
+            f"([CONAE OGC]({CONAE_CATALOG_OGC_URL}), [CONAE Focos]({CONAE_FOCOS_URL}), "
             f"[NASA FIRMS]({FIRMS_PORTAL_URL}) / [Global Fire Map]({FIRMS_MAP_URL}))."
+        )
+        b1, b2 = st.columns(2)
+        b1.link_button(
+            "🌐 Compare in Official NASA FIRMS Fire Map",
+            firms_compare_url,
+            width="stretch",
+            help="Open this exact region and zoom level on NASA FIRMS Official Fire Map.",
+        )
+        b2.link_button(
+            "🛰️ Open Official CONAE Geoportal",
+            CONAE_FOCOS_URL,
+            width="stretch",
+            help="Open Argentina's CONAE Focos de Calor active-fire viewer.",
         )
 
         f1, f2, f3 = st.columns(3)
-        map_years = ["Все годы"] + sorted(result.gridded_df["year"].unique().tolist(), reverse=True)
+        map_years = ["All Years"] + sorted(result.gridded_df["year"].unique().tolist(), reverse=True)
         default_map_year = kpis.get("worst_year")
         default_map_idx = (
             map_years.index(default_map_year)
@@ -1640,22 +1856,31 @@ def main() -> None:
             else (1 if len(map_years) > 1 else 0)
         )
         map_year_sel = f1.selectbox(
-            "Год на карте",
+            "Map Year",
             options=map_years,
             index=default_map_idx,
             key=f"map_year_{region_key}_{source_mode}",
+            help="Filter displayed grid cells and thermal heatmap to a specific year or all years.",
         )
         map_month_sel = f2.selectbox(
-            "Месяц на карте",
-            options=["Все месяцы"] + list(range(1, 13)),
+            "Map Month",
+            options=["All Months"] + list(range(1, 13)),
             format_func=lambda m: m if isinstance(m, str) else f"{m:02d} — {MONTH_LABELS[m - 1]}",
+            help="Filter displayed grid cells and thermal heatmap to a specific calendar month.",
         )
-        max_markers = f3.slider("Макс. ячеек на карте", min_value=100, max_value=1500, value=300, step=100)
+        max_markers = f3.slider(
+            "Max Vector Markers",
+            min_value=100,
+            max_value=1500,
+            value=300,
+            step=100,
+            help="Maximum number of top-FRP circle markers rendered individually (HeatMap always renders all cells).",
+        )
 
         map_df = result.gridded_df.copy()
-        if map_year_sel != "Все годы":
+        if map_year_sel != "All Years":
             map_df = map_df[map_df["year"] == int(map_year_sel)]
-        if map_month_sel != "Все месяцы":
+        if map_month_sel != "All Months":
             map_df = map_df[map_df["month"] == int(map_month_sel)]
 
         fmap = _build_folium_map(map_df, active_bbox, max_points=max_markers)
@@ -1668,7 +1893,7 @@ def main() -> None:
             components.html(map_html, height=540, scrolling=False)
 
         st.divider()
-        st.subheader("📥 Экспорт гармонизированных данных (CSV)")
+        st.subheader("📥 Export Harmonized Datasets (CSV)")
         d1, d2 = st.columns(2)
         d3, d4 = st.columns(2)
 
