@@ -916,6 +916,15 @@ def _make_alpha_bar_chart(calibration_df: pd.DataFrame) -> go.Figure:
 class _SafeLayerControl(folium.LayerControl):
     """LayerControl using `var` and viewport-aware Leaflet resize hooks for tabs."""
 
+    def __init__(
+        self,
+        bbox_bounds: Optional[list[list[float]]] = None,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self.bbox_bounds = bbox_bounds or [[-85.0, -180.0], [85.0, 180.0]]
+
     _template = Template(
         """
         {% macro script(this,kwargs) %}
@@ -943,20 +952,18 @@ class _SafeLayerControl(folium.LayerControl):
 
             (function() {
                 var _map = {{ this._parent.get_name() }};
-                var _center = _map.getCenter();
-                var _zoom = _map.getZoom();
+                var _bboxBounds = L.latLngBounds({{ this.bbox_bounds|tojson }});
                 var _lastWidth = 0;
                 var _refreshMapSize = function() {
                     var el = _map.getContainer();
                     if (!el) return;
                     var w = el.offsetWidth;
                     if (w > 0 && w !== _lastWidth) {
-                        var firstShow = (_lastWidth === 0);
                         _lastWidth = w;
                         _map.invalidateSize(false);
-                        if (firstShow) {
-                            _map.setView(_center, _zoom, {animate: false});
-                        }
+                        _map.fitBounds(_bboxBounds, {padding: [10, 10], animate: false});
+                        _map.setMaxBounds(_bboxBounds.pad(0.05));
+                        _map.setMinZoom(_map.getBoundsZoom(_bboxBounds, false));
                     }
                 };
                 if (typeof ResizeObserver !== "undefined") {
@@ -976,6 +983,12 @@ def _build_folium_map(
     west, south, east, north = bbox
     center_lat = 0.5 * (south + north)
     center_lon = 0.5 * (west + east)
+    pad_lat = max((north - south) * 0.04, 0.01)
+    pad_lon = max((east - west) * 0.04, 0.01)
+    min_lat = max(-85.0, south - pad_lat)
+    max_lat = min(85.0, north + pad_lat)
+    min_lon = max(-180.0, west - pad_lon)
+    max_lon = min(180.0, east + pad_lon)
 
     fmap = folium.Map(
         location=[center_lat, center_lon],
@@ -986,10 +999,11 @@ def _build_folium_map(
         no_wrap=True,
         min_zoom=3,
         max_bounds=True,
-        min_lat=-85,
-        max_lat=85,
-        min_lon=-180,
-        max_lon=180,
+        max_bounds_viscosity=1.0,
+        min_lat=min_lat,
+        max_lat=max_lat,
+        min_lon=min_lon,
+        max_lon=max_lon,
     )
     folium.TileLayer(
         "OpenStreetMap",
@@ -997,6 +1011,7 @@ def _build_folium_map(
         no_wrap=True,
         bounds=[[-85, -180], [85, 180]],
     ).add_to(fmap)
+    fmap.fit_bounds([[south, west], [north, east]], padding=(10, 10))
 
     # Active Bounding Box polygon
     folium.Rectangle(
@@ -1083,7 +1098,7 @@ def _build_folium_map(
                 show=True,
             ).add_to(fmap)
 
-    _SafeLayerControl(collapsed=False).add_to(fmap)
+    _SafeLayerControl(bbox_bounds=[[south, west], [north, east]], collapsed=False).add_to(fmap)
     return fmap
 
 
@@ -1095,13 +1110,25 @@ def main() -> None:
     st.markdown(
         """
         <style>
-        header[data-testid="stHeader"],
-        [data-testid="stToolbar"],
-        [data-testid="stDecoration"],
+        header[data-testid="stHeader"] {
+            background: transparent !important;
+        }
+        [data-testid="stToolbarActions"],
+        [data-testid="stAppDeployButton"],
         .stAppDeployButton,
+        [data-testid="stMainMenu"],
         #MainMenu,
+        [data-testid="stDecoration"],
+        [data-testid="stStatusWidget"],
         footer {
             display: none !important;
+        }
+        [data-testid="stExpandSidebarButton"],
+        [data-testid="collapsedControl"] {
+            display: flex !important;
+            visibility: visible !important;
+            opacity: 1 !important;
+            pointer-events: auto !important;
         }
         [data-testid="stMetric"] {
             background: rgba(17, 24, 39, 0.85);
@@ -1886,7 +1913,7 @@ def main() -> None:
         fmap = _build_folium_map(map_df, active_bbox, max_points=max_markers)
         map_html = fmap.get_root().render()
         if hasattr(st, "iframe"):
-            st.iframe(map_html, height=540)
+            st.iframe(map_html, height=540, width="stretch")
         else:
             import streamlit.components.v1 as components
 
