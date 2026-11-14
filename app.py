@@ -6,7 +6,7 @@ NASA Space Apps Challenge 2026 — Harmonization of MODIS and VIIRS Hot Spots (N
 from __future__ import annotations
 
 from datetime import date, timedelta
-from typing import Optional
+from typing import Any, Optional
 
 import folium
 from folium.plugins import Draw, HeatMap
@@ -62,12 +62,12 @@ _GEOD = Geod(ellps="WGS84")
 # ---------------------------------------------------------------------------
 # Cached Data & Pipeline Helpers
 # ---------------------------------------------------------------------------
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner="Расчёт гармонизации MODIS и VIIRS...")
 def _load_sample_cached(region_key: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     return generate_regional_sample_data(region_key=region_key, force=False)
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner="Расчёт гармонизации MODIS и VIIRS...")
 def _run_harmonization_cached(
     modis_df: pd.DataFrame,
     viirs_df: pd.DataFrame,
@@ -107,7 +107,7 @@ def _load_regional_calibration_csv(region_key: str) -> Optional[pd.DataFrame]:
     return None
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner="Расчёт гармонизации MODIS и VIIRS...")
 def _load_regional_reference_cached(
     region_key: str,
     modis_min_conf: int,
@@ -139,6 +139,136 @@ def _load_regional_reference_cached(
         cal_df = ref_result.calibration_df.copy()
 
     return ref_result, cal_df
+
+
+@st.cache_data(show_spinner="Расчёт гармонизации MODIS и VIIRS...")
+def _compute_climatology_bundle_cached(
+    monthly_df: pd.DataFrame,
+    gridded_df: pd.DataFrame,
+    transition_metrics: dict[str, Any],
+    ref_monthly_df: Optional[pd.DataFrame],
+    metric_choice: str,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+    """Compute and cache calendar matrix, seasonal climatology, anomalies, and KPIs."""
+    calendar_df = build_calendar_matrix(monthly_df, value_col=metric_choice)
+    is_ref_mode = bool(transition_metrics.get("used_reference_calibration", False))
+    if is_ref_mode and ref_monthly_df is not None:
+        climatology_df = compute_monthly_climatology(ref_monthly_df, value_col=metric_choice)
+        active_live_month = (
+            int(gridded_df["month"].mode().iloc[0])
+            if not gridded_df.empty
+            else None
+        )
+    else:
+        climatology_df = compute_monthly_climatology(monthly_df, value_col=metric_choice)
+        active_live_month = None
+
+    anomalies_df = compute_monthly_anomalies(monthly_df, climatology_df, value_col=metric_choice)
+    kpis = compute_kpi_metrics(
+        monthly_df=monthly_df,
+        anomalies_df=anomalies_df,
+        transition_metrics=transition_metrics,
+        climatology_df=climatology_df,
+        target_year=int(monthly_df["year"].max()),
+        target_month=active_live_month,
+    )
+    return calendar_df, climatology_df, anomalies_df, kpis
+
+
+@st.cache_data(show_spinner="Расчёт гармонизации MODIS и VIIRS...")
+def _run_preset_full_bundle_cached(
+    region_key: str,
+    bbox: tuple[float, float, float, float],
+    start_date: str,
+    end_date: str,
+    daynight_filter: str,
+    modis_min_conf: int,
+    viirs_allowed_conf: tuple[str, ...],
+    combination_mode: str,
+    metric_choice: str,
+) -> tuple[
+    int,
+    int,
+    HarmonizationResult,
+    Optional[HarmonizationResult],
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.DataFrame,
+    dict[str, Any],
+]:
+    """End-to-end cached preset loading, filtering, harmonization, and climatology."""
+    raw_modis_df, raw_viirs_df = _load_sample_cached(region_key)
+    modis_filtered = filter_by_bbox_and_dates(
+        raw_modis_df,
+        bbox=bbox,
+        start_date=start_date,
+        end_date=end_date,
+        daynight=daynight_filter,
+    )
+    viirs_filtered = filter_by_bbox_and_dates(
+        raw_viirs_df,
+        bbox=bbox,
+        start_date=start_date,
+        end_date=end_date,
+        daynight=daynight_filter,
+    )
+
+    all_dates = pd.concat(
+        [
+            modis_filtered["acq_date"] if not modis_filtered.empty else pd.Series(dtype=str),
+            viirs_filtered["acq_date"] if not viirs_filtered.empty else pd.Series(dtype=str),
+        ],
+        ignore_index=True,
+    )
+    unique_years_count = int(all_dates.astype(str).str[:4].nunique()) if not all_dates.empty else 0
+
+    ref_result: Optional[HarmonizationResult] = None
+    ext_cal_df: Optional[pd.DataFrame] = None
+    ext_overlap_df: Optional[pd.DataFrame] = None
+    ref_tm: Optional[dict[str, float]] = None
+    if unique_years_count < 2:
+        ref_result, ext_cal_df = _load_regional_reference_cached(
+            region_key=region_key,
+            modis_min_conf=modis_min_conf,
+            viirs_allowed_conf=viirs_allowed_conf,
+            combination_mode=combination_mode,
+            daynight_filter=daynight_filter,
+        )
+        ext_overlap_df = ref_result.overlap_monthly_df
+        ref_tm = ref_result.transition_metrics
+
+    result = _run_harmonization_cached(
+        modis_df=modis_filtered,
+        viirs_df=viirs_filtered,
+        modis_min_conf=modis_min_conf,
+        viirs_allowed_conf=viirs_allowed_conf,
+        combination_mode=combination_mode,
+        daynight_filter=daynight_filter,
+        external_calibration_df=ext_cal_df,
+        external_overlap_df=ext_overlap_df,
+        reference_transition_metrics=ref_tm,
+    )
+    if result.monthly_df.empty:
+        empty_df = pd.DataFrame()
+        return len(modis_filtered), len(viirs_filtered), result, ref_result, empty_df, empty_df, empty_df, {}
+
+    calendar_df, climatology_df, anomalies_df, kpis = _compute_climatology_bundle_cached(
+        monthly_df=result.monthly_df,
+        gridded_df=result.gridded_df,
+        transition_metrics=result.transition_metrics,
+        ref_monthly_df=ref_result.monthly_df if ref_result is not None else None,
+        metric_choice=metric_choice,
+    )
+    return (
+        len(modis_filtered),
+        len(viirs_filtered),
+        result,
+        ref_result,
+        calendar_df,
+        climatology_df,
+        anomalies_df,
+        kpis,
+    )
 
 
 def _get_sensor_date_bounds(
@@ -788,7 +918,7 @@ class _SafeLayerControl(folium.LayerControl):
 def _build_folium_map(
     gridded_df: pd.DataFrame,
     bbox: tuple[float, float, float, float],
-    max_points: int,
+    max_points: int = 300,
 ) -> folium.Map:
     west, south, east, north = bbox
     center_lat = 0.5 * (south + north)
@@ -847,7 +977,7 @@ def _build_folium_map(
 
     if not gridded_df.empty:
         sample_df = (
-            gridded_df.sample(n=min(len(gridded_df), max_points), random_state=42)
+            gridded_df.nlargest(max_points, "frp_sum")
             if len(gridded_df) > max_points
             else gridded_df
         )
@@ -883,7 +1013,7 @@ def _build_folium_map(
 
         heat_points = [
             [float(r.cell_center_lat), float(r.cell_center_lon), float(np.log1p(r.frp_sum))]
-            for r in sample_df.itertuples(index=False)
+            for r in gridded_df.itertuples(index=False)
         ]
         if heat_points:
             HeatMap(
@@ -1131,128 +1261,143 @@ def main() -> None:
         )
 
     # -----------------------------------------------------------------------
-    # Load Selected Data Source
+    # Load Selected Data Source & Execute Cached Harmonization + Climatology
     # -----------------------------------------------------------------------
-    if source_mode == "Демо-архив (2001–2026, офлайн)":
-        raw_modis_df, raw_viirs_df = _load_sample_cached(region_key)
-        active_region_label = REGION_PRESETS[region_key]["name_ru"]
-    elif source_mode == "Загрузка CSV (FIRMS Archive)":
-        if not uploaded_files:
-            st.warning("Загрузите один или несколько CSV-файлов MODIS/VIIRS в боковой панели, чтобы начать расчёт.")
-            st.stop()
-        raw_modis_df, raw_viirs_df = load_csv_dataset(uploaded_files)
-        active_region_label = "Пользовательский CSV-архив FIRMS"
-    else:
-        raw_modis_df = st.session_state["api_modis_df"]
-        raw_viirs_df = st.session_state["api_viirs_df"]
-        if raw_modis_df.empty and raw_viirs_df.empty:
-            st.info(
-                "Нажмите **«Загрузить данные через FIRMS API»** в боковой панели, чтобы получить "
-                "актуальные данные NASA FIRMS по выбранному региону, или переключитесь на демо-архив."
-            )
-            st.stop()
-        active_region_label = f"Живой API FIRMS ({REGION_PRESETS[region_key]['name_ru']})"
-
-    # Filter by active BBox and year range
-    start_date_str = f"{year_min:04d}-01-01"
-    end_date_str = f"{year_max:04d}-12-31"
-    modis_filtered = filter_by_bbox_and_dates(
-        raw_modis_df,
-        bbox=active_bbox,
-        start_date=start_date_str,
-        end_date=end_date_str,
-        daynight=daynight_option,
-    )
-    viirs_filtered = filter_by_bbox_and_dates(
-        raw_viirs_df,
-        bbox=active_bbox,
-        start_date=start_date_str,
-        end_date=end_date_str,
-        daynight=daynight_option,
-    )
-
     if not viirs_conf:
         st.warning("Выберите хотя бы одну категорию достоверности VIIRS (`n`, `h` или `l`).")
         st.stop()
 
-    all_dates = pd.concat(
-        [
-            modis_filtered["acq_date"] if not modis_filtered.empty else pd.Series(dtype=str),
-            viirs_filtered["acq_date"] if not viirs_filtered.empty else pd.Series(dtype=str),
-        ],
-        ignore_index=True,
-    )
-    unique_years_count = int(all_dates.astype(str).str[:4].nunique()) if not all_dates.empty else 0
-    needs_reference_cal = (
-        source_mode == "Живой запрос NASA FIRMS Area API"
-        or unique_years_count < 2
-    )
+    start_date_str = f"{year_min:04d}-01-01"
+    end_date_str = f"{year_max:04d}-12-31"
+    viirs_conf_tuple = tuple(sorted(viirs_conf))
 
-    ref_result = None
-    ext_cal_df = None
-    ext_overlap_df = None
-    ref_tm = None
-    if needs_reference_cal:
-        ref_result, ext_cal_df = _load_regional_reference_cached(
+    if source_mode == "Демо-архив (2001–2026, офлайн)":
+        active_region_label = REGION_PRESETS[region_key]["name_ru"]
+        (
+            modis_count,
+            viirs_count,
+            result,
+            ref_result,
+            calendar_df,
+            climatology_df,
+            anomalies_df,
+            kpis,
+        ) = _run_preset_full_bundle_cached(
             region_key=region_key,
+            bbox=active_bbox,
+            start_date=start_date_str,
+            end_date=end_date_str,
+            daynight_filter=daynight_option,
             modis_min_conf=modis_min_conf,
-            viirs_allowed_conf=tuple(sorted(viirs_conf)),
+            viirs_allowed_conf=viirs_conf_tuple,
+            combination_mode=combo_mode,
+            metric_choice=metric_choice,
+        )
+        if result.monthly_df.empty:
+            st.warning(
+                "В выбранном регионе и диапазоне дат не найдено очагов, прошедших фильтры достоверности. "
+                "Попробуйте расширить Bounding Box, диапазон лет или снизить порог confidence."
+            )
+            st.stop()
+    else:
+        if source_mode == "Загрузка CSV (FIRMS Archive)":
+            if not uploaded_files:
+                st.warning("Загрузите один или несколько CSV-файлов MODIS/VIIRS в боковой панели, чтобы начать расчёт.")
+                st.stop()
+            raw_modis_df, raw_viirs_df = load_csv_dataset(uploaded_files)
+            active_region_label = "Пользовательский CSV-архив FIRMS"
+        else:
+            raw_modis_df = st.session_state["api_modis_df"]
+            raw_viirs_df = st.session_state["api_viirs_df"]
+            if raw_modis_df.empty and raw_viirs_df.empty:
+                st.info(
+                    "Нажмите **«Загрузить данные через FIRMS API»** в боковой панели, чтобы получить "
+                    "актуальные данные NASA FIRMS по выбранному региону, или переключитесь на демо-архив."
+                )
+                st.stop()
+            active_region_label = f"Живой API FIRMS ({REGION_PRESETS[region_key]['name_ru']})"
+
+        modis_filtered = filter_by_bbox_and_dates(
+            raw_modis_df,
+            bbox=active_bbox,
+            start_date=start_date_str,
+            end_date=end_date_str,
+            daynight=daynight_option,
+        )
+        viirs_filtered = filter_by_bbox_and_dates(
+            raw_viirs_df,
+            bbox=active_bbox,
+            start_date=start_date_str,
+            end_date=end_date_str,
+            daynight=daynight_option,
+        )
+        modis_count = len(modis_filtered)
+        viirs_count = len(viirs_filtered)
+
+        all_dates = pd.concat(
+            [
+                modis_filtered["acq_date"] if not modis_filtered.empty else pd.Series(dtype=str),
+                viirs_filtered["acq_date"] if not viirs_filtered.empty else pd.Series(dtype=str),
+            ],
+            ignore_index=True,
+        )
+        unique_years_count = int(all_dates.astype(str).str[:4].nunique()) if not all_dates.empty else 0
+        needs_reference_cal = (
+            source_mode == "Живой запрос NASA FIRMS Area API"
+            or unique_years_count < 2
+        )
+
+        ref_result = None
+        ext_cal_df = None
+        ext_overlap_df = None
+        ref_tm = None
+        if needs_reference_cal:
+            ref_result, ext_cal_df = _load_regional_reference_cached(
+                region_key=region_key,
+                modis_min_conf=modis_min_conf,
+                viirs_allowed_conf=viirs_conf_tuple,
+                combination_mode=combo_mode,
+                daynight_filter=daynight_option,
+            )
+            ext_overlap_df = ref_result.overlap_monthly_df
+            ref_tm = ref_result.transition_metrics
+
+        result = _run_harmonization_cached(
+            modis_df=modis_filtered,
+            viirs_df=viirs_filtered,
+            modis_min_conf=modis_min_conf,
+            viirs_allowed_conf=viirs_conf_tuple,
             combination_mode=combo_mode,
             daynight_filter=daynight_option,
+            external_calibration_df=ext_cal_df,
+            external_overlap_df=ext_overlap_df,
+            reference_transition_metrics=ref_tm,
         )
-        ext_overlap_df = ref_result.overlap_monthly_df
-        ref_tm = ref_result.transition_metrics
 
-    result = _run_harmonization_cached(
-        modis_df=modis_filtered,
-        viirs_df=viirs_filtered,
-        modis_min_conf=modis_min_conf,
-        viirs_allowed_conf=tuple(sorted(viirs_conf)),
-        combination_mode=combo_mode,
-        daynight_filter=daynight_option,
-        external_calibration_df=ext_cal_df,
-        external_overlap_df=ext_overlap_df,
-        reference_transition_metrics=ref_tm,
-    )
+        if result.monthly_df.empty:
+            st.warning(
+                "В выбранном регионе и диапазоне дат не найдено очагов, прошедших фильтры достоверности. "
+                "Попробуйте расширить Bounding Box, диапазон лет или снизить порог confidence."
+            )
+            st.stop()
 
-    if result.monthly_df.empty:
-        st.warning(
-            "В выбранном регионе и диапазоне дат не найдено очагов, прошедших фильтры достоверности. "
-            "Попробуйте расширить Bounding Box, диапазон лет или снизить порог confidence."
+        calendar_df, climatology_df, anomalies_df, kpis = _compute_climatology_bundle_cached(
+            monthly_df=result.monthly_df,
+            gridded_df=result.gridded_df,
+            transition_metrics=result.transition_metrics,
+            ref_monthly_df=ref_result.monthly_df if ref_result is not None else None,
+            metric_choice=metric_choice,
         )
-        st.stop()
 
     use_frp = metric_choice == "harmonized_frp"
     metric_label = "Гармонизированный FRP (МВт)" if use_frp else "Гармонизированные очаги (ячейки 1 км)"
-
-    calendar_df = build_calendar_matrix(result.monthly_df, value_col=metric_choice)
     tm = result.transition_metrics
     is_ref_mode = bool(tm.get("used_reference_calibration", False))
-    if is_ref_mode and ref_result is not None:
-        climatology_df = compute_monthly_climatology(ref_result.monthly_df, value_col=metric_choice)
-        active_live_month = (
-            int(result.gridded_df["month"].mode().iloc[0])
-            if not result.gridded_df.empty
-            else None
-        )
-    else:
-        climatology_df = compute_monthly_climatology(result.monthly_df, value_col=metric_choice)
-        active_live_month = None
-
-    anomalies_df = compute_monthly_anomalies(result.monthly_df, climatology_df, value_col=metric_choice)
-    kpis = compute_kpi_metrics(
-        monthly_df=result.monthly_df,
-        anomalies_df=anomalies_df,
-        transition_metrics=tm,
-        climatology_df=climatology_df,
-        target_year=int(result.monthly_df["year"].max()),
-        target_month=active_live_month,
-    )
 
     area_km2 = _compute_bbox_area_km2(active_bbox)
     st.markdown(
         f"**Регион:** {active_region_label} · **Площадь BBox:** {area_km2:,.0f} км² · "
-        f"**Точек после фильтрации:** MODIS `{len(modis_filtered):,}` | VIIRS `{len(viirs_filtered):,}`"
+        f"**Точек после фильтрации:** MODIS `{modis_count:,}` | VIIRS `{viirs_count:,}`"
     )
     if is_ref_mode:
         st.info(
@@ -1498,7 +1643,7 @@ def main() -> None:
             options=["Все месяцы"] + list(range(1, 13)),
             format_func=lambda m: m if isinstance(m, str) else f"{m:02d} — {MONTH_LABELS[m - 1]}",
         )
-        max_markers = f3.slider("Макс. ячеек на карте", min_value=300, max_value=3000, value=1200, step=100)
+        max_markers = f3.slider("Макс. ячеек на карте", min_value=100, max_value=1500, value=300, step=100)
 
         map_df = result.gridded_df.copy()
         if map_year_sel != "Все годы":

@@ -251,7 +251,7 @@ def grid_spatiotemporal_clusters(
 def _bootstrap_median_ratio_ci(
     modis_vals: np.ndarray,
     viirs_vals: np.ndarray,
-    n_bootstrap: int = 500,
+    n_bootstrap: int = 100,
     seed: int = 42,
 ) -> tuple[float, float]:
     """Compute 95% bootstrap confidence interval for Median(MODIS) / Median(VIIRS)."""
@@ -272,7 +272,7 @@ def _bootstrap_median_ratio_ci(
 def compute_overlap_calibration(
     gridded_df: pd.DataFrame,
     overlap_years: tuple[int, int] = OVERLAP_YEARS,
-    n_bootstrap: int = 500,
+    n_bootstrap: int = 100,
     seed: int = 42,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, float]]:
     """Step 4a: Derive monthly & day/night alpha(m, daynight) factors on overlap (2012–2025)."""
