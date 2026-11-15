@@ -6,6 +6,7 @@ NASA Space Apps Challenge 2026 — Harmonization of MODIS and VIIRS Hot Spots (N
 from __future__ import annotations
 
 from datetime import date, timedelta
+import gc
 from typing import Any, Optional
 
 import folium
@@ -68,12 +69,49 @@ PLOTLY_CONFIG: dict[str, Any] = {
 # ---------------------------------------------------------------------------
 # Cached Data & Pipeline Helpers
 # ---------------------------------------------------------------------------
-@st.cache_data(show_spinner="Computing MODIS & VIIRS harmonization...")
+@st.cache_data(
+    max_entries=2,
+    ttl=1800,
+    show_spinner="Computing MODIS & VIIRS harmonization...",
+)
 def _load_sample_cached(region_key: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     return generate_regional_sample_data(region_key=region_key, force=False)
 
 
-@st.cache_data(show_spinner="Computing MODIS & VIIRS harmonization...")
+def _execute_harmonization(
+    modis_df: pd.DataFrame,
+    viirs_df: pd.DataFrame,
+    modis_min_conf: int,
+    viirs_allowed_conf: tuple[str, ...],
+    combination_mode: str,
+    daynight_filter: str,
+    external_calibration_df: Optional[pd.DataFrame] = None,
+    external_overlap_df: Optional[pd.DataFrame] = None,
+    reference_transition_metrics: Optional[dict[str, float]] = None,
+) -> HarmonizationResult:
+    """Run HarmonizationPipeline and drop unused raw filtered points to save RAM."""
+    pipeline = HarmonizationPipeline(
+        modis_min_conf=modis_min_conf,
+        viirs_allowed_conf=list(viirs_allowed_conf),
+        combination_mode=combination_mode,
+        daynight_filter=daynight_filter,
+    )
+    res = pipeline.run(
+        modis_df,
+        viirs_df,
+        external_calibration_df=external_calibration_df,
+        external_overlap_df=external_overlap_df,
+        reference_transition_metrics=reference_transition_metrics,
+    )
+    res.filtered_points_df = pd.DataFrame()
+    return res
+
+
+@st.cache_data(
+    max_entries=2,
+    ttl=1800,
+    show_spinner="Computing MODIS & VIIRS harmonization...",
+)
 def _run_harmonization_cached(
     modis_df: pd.DataFrame,
     viirs_df: pd.DataFrame,
@@ -85,22 +123,20 @@ def _run_harmonization_cached(
     external_overlap_df: Optional[pd.DataFrame] = None,
     reference_transition_metrics: Optional[dict[str, float]] = None,
 ) -> HarmonizationResult:
-    pipeline = HarmonizationPipeline(
+    return _execute_harmonization(
+        modis_df=modis_df,
+        viirs_df=viirs_df,
         modis_min_conf=modis_min_conf,
-        viirs_allowed_conf=list(viirs_allowed_conf),
+        viirs_allowed_conf=viirs_allowed_conf,
         combination_mode=combination_mode,
         daynight_filter=daynight_filter,
-    )
-    return pipeline.run(
-        modis_df,
-        viirs_df,
         external_calibration_df=external_calibration_df,
         external_overlap_df=external_overlap_df,
         reference_transition_metrics=reference_transition_metrics,
     )
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(max_entries=5, show_spinner=False)
 def _load_regional_calibration_csv(region_key: str) -> Optional[pd.DataFrame]:
     cal_path = PROCESSED_DIR / f"calibration_alpha_{region_key}.csv"
     if cal_path.exists():
@@ -113,7 +149,11 @@ def _load_regional_calibration_csv(region_key: str) -> Optional[pd.DataFrame]:
     return None
 
 
-@st.cache_data(show_spinner="Computing MODIS & VIIRS harmonization...")
+@st.cache_data(
+    max_entries=2,
+    ttl=1800,
+    show_spinner="Computing MODIS & VIIRS harmonization...",
+)
 def _load_regional_reference_cached(
     region_key: str,
     modis_min_conf: int,
@@ -126,7 +166,7 @@ def _load_regional_reference_cached(
     ref_modis_dn = filter_by_bbox_and_dates(ref_modis, daynight=daynight_filter)
     ref_viirs_dn = filter_by_bbox_and_dates(ref_viirs, daynight=daynight_filter)
 
-    ref_result = _run_harmonization_cached(
+    ref_result = _execute_harmonization(
         modis_df=ref_modis_dn,
         viirs_df=ref_viirs_dn,
         modis_min_conf=modis_min_conf,
@@ -147,15 +187,14 @@ def _load_regional_reference_cached(
     return ref_result, cal_df
 
 
-@st.cache_data(show_spinner="Computing MODIS & VIIRS harmonization...")
-def _compute_climatology_bundle_cached(
+def _compute_climatology_bundle(
     monthly_df: pd.DataFrame,
     gridded_df: pd.DataFrame,
     transition_metrics: dict[str, Any],
     ref_monthly_df: Optional[pd.DataFrame],
     metric_choice: str,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, Any]]:
-    """Compute and cache calendar matrix, seasonal climatology, anomalies, and KPIs."""
+    """Compute calendar matrix, seasonal climatology, anomalies, and KPIs."""
     calendar_df = build_calendar_matrix(monthly_df, value_col=metric_choice)
     is_ref_mode = bool(transition_metrics.get("used_reference_calibration", False))
     if is_ref_mode and ref_monthly_df is not None:
@@ -181,7 +220,33 @@ def _compute_climatology_bundle_cached(
     return calendar_df, climatology_df, anomalies_df, kpis
 
 
-@st.cache_data(show_spinner="Computing MODIS & VIIRS harmonization...")
+@st.cache_data(
+    max_entries=2,
+    ttl=1800,
+    show_spinner="Computing MODIS & VIIRS harmonization...",
+)
+def _compute_climatology_bundle_cached(
+    monthly_df: pd.DataFrame,
+    gridded_df: pd.DataFrame,
+    transition_metrics: dict[str, Any],
+    ref_monthly_df: Optional[pd.DataFrame],
+    metric_choice: str,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+    """Compute and cache calendar matrix, seasonal climatology, anomalies, and KPIs."""
+    return _compute_climatology_bundle(
+        monthly_df=monthly_df,
+        gridded_df=gridded_df,
+        transition_metrics=transition_metrics,
+        ref_monthly_df=ref_monthly_df,
+        metric_choice=metric_choice,
+    )
+
+
+@st.cache_data(
+    max_entries=2,
+    ttl=1800,
+    show_spinner="Computing MODIS & VIIRS harmonization...",
+)
 def _run_preset_full_bundle_cached(
     region_key: str,
     bbox: tuple[float, float, float, float],
@@ -218,6 +283,8 @@ def _run_preset_full_bundle_cached(
         end_date=end_date,
         daynight=daynight_filter,
     )
+    modis_count = len(modis_filtered)
+    viirs_count = len(viirs_filtered)
 
     all_dates = pd.concat(
         [
@@ -243,7 +310,7 @@ def _run_preset_full_bundle_cached(
         ext_overlap_df = ref_result.overlap_monthly_df
         ref_tm = ref_result.transition_metrics
 
-    result = _run_harmonization_cached(
+    result = _execute_harmonization(
         modis_df=modis_filtered,
         viirs_df=viirs_filtered,
         modis_min_conf=modis_min_conf,
@@ -254,20 +321,24 @@ def _run_preset_full_bundle_cached(
         external_overlap_df=ext_overlap_df,
         reference_transition_metrics=ref_tm,
     )
+    del modis_filtered, viirs_filtered, all_dates
+
     if result.monthly_df.empty:
         empty_df = pd.DataFrame()
-        return len(modis_filtered), len(viirs_filtered), result, ref_result, empty_df, empty_df, empty_df, {}
+        gc.collect()
+        return modis_count, viirs_count, result, ref_result, empty_df, empty_df, empty_df, {}
 
-    calendar_df, climatology_df, anomalies_df, kpis = _compute_climatology_bundle_cached(
+    calendar_df, climatology_df, anomalies_df, kpis = _compute_climatology_bundle(
         monthly_df=result.monthly_df,
         gridded_df=result.gridded_df,
         transition_metrics=result.transition_metrics,
         ref_monthly_df=ref_result.monthly_df if ref_result is not None else None,
         metric_choice=metric_choice,
     )
+    gc.collect()
     return (
-        len(modis_filtered),
-        len(viirs_filtered),
+        modis_count,
+        viirs_count,
         result,
         ref_result,
         calendar_df,
