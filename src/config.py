@@ -98,6 +98,16 @@ FIRMS_SOURCES: dict[str, dict[str, Any]] = {
         "label": "VIIRS NOAA-20 NRT (VJ114IMGTDL_NRT)",
         "resolution_m": 375,
     },
+    "VIIRS_NOAA21_SP": {
+        "sensor": "VIIRS",
+        "label": "VIIRS NOAA-21 Standard (VJ214IMG)",
+        "resolution_m": 375,
+    },
+    "VIIRS_NOAA21_NRT": {
+        "sensor": "VIIRS",
+        "label": "VIIRS NOAA-21 NRT (VJ214IMGTDL_NRT)",
+        "resolution_m": 375,
+    },
 }
 
 MODIS_COLUMNS: list[str] = [

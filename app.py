@@ -1756,7 +1756,7 @@ def main() -> None:
         dayfirst_dates = False
         api_days = 5
         api_modis_src = "MODIS_NRT"
-        api_viirs_src = "VIIRS_NOAA20_NRT"
+        api_viirs_src = "VIIRS_NOAA21_NRT"
         api_start_date = date.today() - timedelta(days=4)
 
         if source_mode == upload_source_label:
@@ -1839,9 +1839,16 @@ def main() -> None:
             )
             api_viirs_src = st.selectbox(
                 "VIIRS Source",
-                ["VIIRS_NOAA20_NRT", "VIIRS_SNPP_NRT", "VIIRS_NOAA20_SP", "VIIRS_SNPP_SP"],
+                [
+                    "VIIRS_NOAA21_NRT",
+                    "VIIRS_NOAA20_NRT",
+                    "VIIRS_NOAA21_SP",
+                    "VIIRS_NOAA20_SP",
+                    "VIIRS_SNPP_NRT",
+                    "VIIRS_SNPP_SP",
+                ],
                 index=0,
-                help="Select VIIRS NOAA-20 or Suomi NPP NRT/SP stream.",
+                help="Select VIIRS NOAA-21, NOAA-20, or Suomi NPP NRT/SP stream.",
             )
 
             per_src_bounds, common_min_dt, common_max_dt = _get_sensor_date_bounds(

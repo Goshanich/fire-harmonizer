@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from src.config import QUICK_LOCATIONS, validate_bbox
+from src.config import FIRMS_SOURCES, QUICK_LOCATIONS, validate_bbox
 from src.harmonizer import (
     HarmonizationPipeline,
     build_daily_sensor_breakdown,
@@ -194,3 +194,11 @@ def test_separate_sensor_frp_no_double_counting() -> None:
     )
     daily_ens = build_daily_sensor_breakdown(res_ens.gridded_df, res_ens.harmonized_cells_df)
     assert abs(daily_ens["harmonized_frp"].sum() - 900.0) < 1.0
+
+
+def test_viirs_noaa21_sources_configured() -> None:
+    assert "VIIRS_NOAA21_NRT" in FIRMS_SOURCES
+    assert "VIIRS_NOAA21_SP" in FIRMS_SOURCES
+    assert FIRMS_SOURCES["VIIRS_NOAA21_NRT"]["sensor"] == "VIIRS"
+    assert FIRMS_SOURCES["VIIRS_NOAA21_SP"]["sensor"] == "VIIRS"
+
