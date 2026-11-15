@@ -966,13 +966,15 @@ class _SafeLayerControl(folium.LayerControl):
                         var firstShow = (_lastWidth === 0);
                         _lastWidth = w;
                         _map.invalidateSize(false);
-                        _map.options.zoomSnap = 0.1;
+                        _map.options.zoomSnap = 0.05;
                         _map.options.zoomDelta = 0.5;
-                        var minZoomForWidth = Math.max(2, Math.ceil((Math.log2(Math.max(w, 300) / 256)) * 10) / 10);
+                        _map.options.bounceAtZoomLimits = false;
+                        var minZoomForWidth = Math.max(2.2, Math.ceil((Math.log2(Math.max(w, 400) / 256) + 0.25) * 20) / 20);
                         _map.setMinZoom(minZoomForWidth);
-                        _map.setMaxBounds([[-85, -180], [85, 180]]);
+                        _map.setMaxBounds([[-85, -179.9], [85, 179.9]]);
                         if (firstShow) {
-                            var targetZoom = Math.max(_map.getBoundsZoom(_bboxBounds, false, L.point(20, 20)), minZoomForWidth);
+                            var fitZ = _map.getBoundsZoom(_bboxBounds, false, L.point(16, 16));
+                            var targetZoom = Math.max(fitZ, minZoomForWidth);
                             _map.setView(_bboxBounds.getCenter(), targetZoom, {animate: false});
                         } else if (_map.getZoom() < minZoomForWidth) {
                             _map.setZoom(minZoomForWidth, {animate: false});
@@ -1014,8 +1016,11 @@ def _build_folium_map(
     )
     fmap.get_root().header.add_child(
         folium.Element(
-            "<style>html, body { margin: 0 !important; padding: 0 !important; "
-            "width: 100% !important; height: 100% !important; overflow: hidden !important; }</style>"
+            "<style>"
+            "html, body { margin: 0 !important; padding: 0 !important; "
+            "width: 100% !important; height: 100% !important; overflow: hidden !important; } "
+            ".leaflet-container { width: 100% !important; height: 100% !important; background: #aad3df !important; }"
+            "</style>"
         )
     )
     folium.TileLayer(
@@ -1024,7 +1029,6 @@ def _build_folium_map(
         no_wrap=True,
         bounds=[[-85, -180], [85, 180]],
     ).add_to(fmap)
-    fmap.fit_bounds([[south, west], [north, east]], padding=(10, 10))
 
     # Active Bounding Box polygon
     folium.Rectangle(
@@ -1143,14 +1147,26 @@ def main() -> None:
             opacity: 1 !important;
             pointer-events: auto !important;
         }
-        section[data-testid="stSidebar"][aria-expanded="true"] {
-            min-width: 390px !important;
-            width: 390px !important;
+        section[data-testid="stSidebar"][aria-expanded="true"],
+        section[data-testid="stSidebar"][aria-expanded="true"] > div:first-child,
+        section[data-testid="stSidebar"][aria-expanded="true"] [data-testid="stSidebarContent"] {
+            min-width: 430px !important;
+            width: 430px !important;
+            max-width: 430px !important;
         }
         section[data-testid="stSidebar"] [data-testid="stWidgetLabel"] p {
             white-space: normal !important;
             overflow: visible !important;
             text-overflow: clip !important;
+        }
+        section[data-testid="stSidebar"] [data-baseweb="select"] > div,
+        section[data-testid="stSidebar"] [data-baseweb="select"] span,
+        section[data-testid="stSidebar"] [data-baseweb="select"] div {
+            white-space: normal !important;
+            overflow: visible !important;
+            text-overflow: clip !important;
+            height: auto !important;
+            min-height: 2.2rem !important;
         }
         [data-testid="stMetric"] {
             background: rgba(17, 24, 39, 0.85);
