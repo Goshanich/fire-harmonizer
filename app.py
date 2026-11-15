@@ -2756,8 +2756,45 @@ def main() -> None:
                 help="Open this exact region and zoom level on NASA FIRMS Official Fire Map.",
             )
 
+        f1, f2 = st.columns(2)
+        map_years = ["All Years"] + sorted(result.gridded_df["year"].unique().tolist(), reverse=True)
+        default_map_year = None if is_in_window_explore or is_explore_mode else kpis.get("worst_year")
+        default_map_idx = (
+            map_years.index(default_map_year)
+            if default_map_year in map_years
+            else 0
+        )
+        map_year_sel = f1.selectbox(
+            "Map Year",
+            options=map_years,
+            index=default_map_idx,
+            key=f"map_year_{export_slug}_{source_mode}",
+            help="Filter displayed grid cells and thermal heatmap to a specific year or all years.",
+        )
+        map_month_sel = f2.selectbox(
+            "Map Month",
+            options=["All Months"] + list(range(1, 13)),
+            format_func=lambda m: m if isinstance(m, str) else f"{m:02d} — {MONTH_LABELS[m - 1]}",
+            help="Filter displayed grid cells and thermal heatmap to a specific calendar month.",
+        )
+
         map_df = result.gridded_df.copy()
-        fmap = _build_folium_map(map_df, active_bbox, max_points=300)
+        if map_year_sel != "All Years":
+            map_df = map_df[map_df["year"] == int(map_year_sel)]
+        if map_month_sel != "All Months":
+            map_df = map_df[map_df["month"] == int(map_month_sel)]
+
+        if len(map_df) > 1000:
+            st.caption(
+                f"Showing top 1,000 vector markers by FRP out of {len(map_df):,} active 0.01° cells "
+                "(HeatMap renders 100% of cells). Select a specific Year/Month above to inspect fewer cells."
+            )
+        elif len(map_df) > 0:
+            st.caption(
+                f"Displaying all {len(map_df):,} active 0.01° cells as vector markers + HeatMap."
+            )
+
+        fmap = _build_folium_map(map_df, active_bbox, max_points=1000)
         map_html = fmap.get_root().render()
         if hasattr(st, "iframe"):
             st.iframe(map_html, height=540, width="stretch")
