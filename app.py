@@ -1586,7 +1586,6 @@ def main() -> None:
         ref_mode_label = "📌 Reference Case — Córdoba, Argentina (2001–2025)"
         explore_mode_label = "🌐 Explore Any Region (Live API / Custom CSV)"
         real_source_label = "Real NASA FIRMS Archive — Córdoba (2001–2025)"
-        synth_source_label = "Synthetic Validation Benchmark (2001–2026)"
         api_source_label = "Live NASA FIRMS Area API"
         upload_source_label = "Upload CSV (FIRMS Archive)"
 
@@ -1595,22 +1594,15 @@ def main() -> None:
             options=[ref_mode_label, explore_mode_label],
             index=0,
             help=(
-                "Use Reference Case to explore the validated 2001–2025 Córdoba archive or synthetic benchmarks, "
+                "Use Reference Case to explore the validated 2001–2025 Córdoba real satellite archive, "
                 "or switch to Explore Any Region for Live NASA FIRMS API / custom CSVs anywhere on Earth."
             ),
         )
         is_explore_mode = operating_mode == explore_mode_label
 
         if not is_explore_mode:
-            source_mode = st.radio(
-                "Data Source",
-                options=[real_source_label, synth_source_label],
-                index=0,
-                help=(
-                    "Inspect the official 2001–2025 NASA FIRMS satellite archive for Córdoba (MODIS C6.1 + VIIRS C2) "
-                    "or the 3-biome synthetic ground-truth recovery benchmark."
-                ),
-            )
+            source_mode = real_source_label
+            st.caption(f"**Data Source:** {real_source_label}")
         else:
             source_mode = st.radio(
                 "Data Source",
@@ -1622,7 +1614,7 @@ def main() -> None:
                 ),
             )
 
-        is_real_cordoba_mode = (not is_explore_mode) and (source_mode == real_source_label)
+        is_real_cordoba_mode = not is_explore_mode
         if is_real_cordoba_mode and st.session_state.get("last_source_mode") != source_mode:
             st.session_state["selected_region"] = "cordoba_argentina"
             st.session_state["last_preset"] = "cordoba_argentina"
@@ -1640,11 +1632,8 @@ def main() -> None:
                 options=preset_keys,
                 format_func=lambda k: REGION_PRESETS[k]["name"],
                 key="selected_region",
-                disabled=is_real_cordoba_mode,
-                help=(
-                    "Locked to Córdoba Province when viewing the Real NASA FIRMS Córdoba archive; "
-                    "all 3 regional biomes are unlocked in Synthetic Validation Benchmark mode."
-                ),
+                disabled=True,
+                help="Locked to Córdoba Province for the Real NASA FIRMS 2001–2025 archive.",
             )
             if region_key != st.session_state["last_preset"]:
                 st.session_state["last_preset"] = region_key
@@ -1743,13 +1732,6 @@ def main() -> None:
             width="stretch",
             help="Open the current Bounding Box center on NASA's official FIRMS Global Fire Map.",
         )
-        if not is_explore_mode:
-            st.link_button(
-                "🛰️ Open Official CONAE Geoportal",
-                CONAE_FOCOS_URL,
-                width="stretch",
-                help="Inspect Argentina's official CONAE Focos de Calor portal and OGC catalog.",
-            )
 
         # Source-specific input widgets
         uploaded_files = None
@@ -2211,13 +2193,6 @@ def main() -> None:
         st.success(
             "✅ Real NASA FIRMS Satellite Archive: MODIS C6.1 (MCD14DL) + Suomi NPP VIIRS C2 (VNP14IMG) "
             "· Córdoba Province, Argentina (2001–2025)."
-        )
-    elif (not is_explore_mode) and source_mode == synth_source_label:
-        st.warning(
-            "🧪 **DEMO / Benchmark (Synthetic Validation 2001–2026):** "
-            "Algorithmic self-consistency benchmark (`data/sample/`) with known latent fire activity used to verify "
-            "2012 step-jump suppression and out-of-sample α recovery. For real satellite observations, "
-            "use **Real NASA FIRMS Archive — Córdoba (2001–2025)** or switch to **Explore Any Region**."
         )
     if (not is_in_window_explore) and (not has_overlap):
         st.warning(
@@ -2781,43 +2756,8 @@ def main() -> None:
                 help="Open this exact region and zoom level on NASA FIRMS Official Fire Map.",
             )
 
-        f1, f2, f3 = st.columns(3)
-        map_years = ["All Years"] + sorted(result.gridded_df["year"].unique().tolist(), reverse=True)
-        default_map_year = None if is_in_window_explore else kpis.get("worst_year")
-        default_map_idx = (
-            map_years.index(default_map_year)
-            if default_map_year in map_years
-            else (1 if len(map_years) > 1 and not is_in_window_explore else 0)
-        )
-        map_year_sel = f1.selectbox(
-            "Map Year",
-            options=map_years,
-            index=default_map_idx,
-            key=f"map_year_{export_slug}_{source_mode}",
-            help="Filter displayed grid cells and thermal heatmap to a specific year or all years.",
-        )
-        map_month_sel = f2.selectbox(
-            "Map Month",
-            options=["All Months"] + list(range(1, 13)),
-            format_func=lambda m: m if isinstance(m, str) else f"{m:02d} — {MONTH_LABELS[m - 1]}",
-            help="Filter displayed grid cells and thermal heatmap to a specific calendar month.",
-        )
-        max_markers = f3.slider(
-            "Max Vector Markers",
-            min_value=100,
-            max_value=1500,
-            value=300,
-            step=100,
-            help="Maximum number of top-FRP circle markers rendered individually (HeatMap always renders all cells).",
-        )
-
         map_df = result.gridded_df.copy()
-        if map_year_sel != "All Years":
-            map_df = map_df[map_df["year"] == int(map_year_sel)]
-        if map_month_sel != "All Months":
-            map_df = map_df[map_df["month"] == int(map_month_sel)]
-
-        fmap = _build_folium_map(map_df, active_bbox, max_points=max_markers)
+        fmap = _build_folium_map(map_df, active_bbox, max_points=300)
         map_html = fmap.get_root().render()
         if hasattr(st, "iframe"):
             st.iframe(map_html, height=540, width="stretch")
