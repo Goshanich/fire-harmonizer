@@ -1,7 +1,7 @@
 # NASA Space Apps Challenge 2026 — Project Page Submission Guide
 
 **Team Name:** VISLUCHKY  
-**Team Members:** Yegor Horenych *(add any additional team members on the Project Page if applicable)*  
+**Team Members:** Yehor Horenych, Felix Romanov, Malieiev Oleksii, Sokolov Volodymyr, Marynets Oleksandr  
 **Selected Challenge:** Harmonization of MODIS and VIIRS Hot Spots (NASA & CONAE)  
 **Language:** English (required for all Project Page fields and attachments)
 
