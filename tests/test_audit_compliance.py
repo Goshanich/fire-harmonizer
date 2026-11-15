@@ -325,19 +325,6 @@ def test_validate_bbox_checks() -> None:
 def test_app_helpers_and_charts_smoke() -> None:
     import app as st_app
 
-    gj = {
-        "type": "FeatureCollection",
-        "features": [
-            {
-                "type": "Feature",
-                "geometry": {
-                    "type": "Polygon",
-                    "coordinates": [[[-65.5, -32.5], [-64.0, -32.5], [-64.0, -30.5], [-65.5, -30.5], [-65.5, -32.5]]],
-                },
-            }
-        ],
-    }
-    assert st_app._extract_bbox_from_geojson(gj) == (-65.5, -32.5, -64.0, -30.5)
     assert st_app._compact_status("Critical Anomaly (Robust Z > +1.5)") == "Critical (Robust Z>+1.5)"
     assert st_app._compact_status("No Data") == "No Data"
 

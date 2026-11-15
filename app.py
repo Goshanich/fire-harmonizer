@@ -19,11 +19,6 @@ import plotly.graph_objects as go
 from pyproj import Geod
 import streamlit as st
 
-try:
-    from shapely.geometry import shape as _shapely_shape
-except ImportError:  # pragma: no cover - optional geometry helper
-    _shapely_shape = None
-
 from src.analytics import (
     MONTH_LABELS,
     build_calendar_matrix,
@@ -36,8 +31,6 @@ from src.analytics import (
 from src.config import (
     COLOR_PALETTES,
     COLOR_SCALE_MODES,
-    CONAE_CATALOG_OGC_URL,
-    CONAE_FOCOS_URL,
     CONAE_WMS_BASE_URL,
     DEFAULT_MODIS_MIN_CONFIDENCE,
     DEFAULT_VIIRS_CONFIDENCE,
@@ -470,55 +463,6 @@ def _compute_bbox_area_km2(bbox: tuple[float, float, float, float]) -> float:
     return abs(area_m2) / 1_000_000.0
 
 
-def _extract_bbox_from_geojson(payload: Any) -> Optional[tuple[float, float, float, float]]:
-    """Extract (west, south, east, north) bounds from a GeoJSON object."""
-    if not isinstance(payload, dict):
-        return None
-    if _shapely_shape is not None:
-        try:
-            gtype = payload.get("type")
-            if gtype == "FeatureCollection":
-                bounds_list = [
-                    _shapely_shape(feat["geometry"]).bounds
-                    for feat in payload.get("features", [])
-                    if isinstance(feat, dict) and feat.get("geometry")
-                ]
-                if bounds_list:
-                    w = min(b[0] for b in bounds_list)
-                    s = min(b[1] for b in bounds_list)
-                    e = max(b[2] for b in bounds_list)
-                    n = max(b[3] for b in bounds_list)
-                    return (round(float(w), 4), round(float(s), 4), round(float(e), 4), round(float(n), 4))
-            elif gtype == "Feature" and payload.get("geometry"):
-                b = _shapely_shape(payload["geometry"]).bounds
-                return (round(float(b[0]), 4), round(float(b[1]), 4), round(float(b[2]), 4), round(float(b[3]), 4))
-            elif "coordinates" in payload:
-                b = _shapely_shape(payload).bounds
-                return (round(float(b[0]), 4), round(float(b[1]), 4), round(float(b[2]), 4), round(float(b[3]), 4))
-        except Exception:
-            pass
-
-    lons: list[float] = []
-    lats: list[float] = []
-
-    def _walk(node: Any) -> None:
-        if isinstance(node, (list, tuple)):
-            if len(node) >= 2 and isinstance(node[0], (int, float)) and isinstance(node[1], (int, float)):
-                lons.append(float(node[0]))
-                lats.append(float(node[1]))
-            else:
-                for item in node:
-                    _walk(item)
-        elif isinstance(node, dict):
-            for val in node.values():
-                _walk(val)
-
-    _walk(payload)
-    if not lons or not lats:
-        return None
-    return (round(min(lons), 4), round(min(lats), 4), round(max(lons), 4), round(max(lats), 4))
-
-
 def _apply_bbox_to_state(bbox: tuple[float, float, float, float]) -> None:
     west, south, east, north = (round(float(v), 4) for v in bbox)
     st.session_state["bbox_west"] = west
@@ -557,8 +501,6 @@ def _init_session_state() -> None:
         st.session_state["last_quick_location"] = "Custom Coordinates (Manual Input)"
     if "api_failed_windows" not in st.session_state:
         st.session_state["api_failed_windows"] = []
-    if "last_geojson_sig" not in st.session_state:
-        st.session_state["last_geojson_sig"] = ""
 
 
 def _estimate_zoom_for_bbox(bbox: tuple[float, float, float, float]) -> int:
@@ -1654,25 +1596,6 @@ def main() -> None:
                 if helper_bbox is not None:
                     _apply_bbox_to_state(helper_bbox)
 
-            geojson_file = st.file_uploader(
-                "Upload AOI Polygon/BBox (.geojson / .json)",
-                type=["geojson", "json"],
-                help="Optional: upload a GeoJSON Polygon, MultiPolygon, Feature, or FeatureCollection to set the Bounding Box automatically.",
-            )
-            if geojson_file is not None:
-                gj_sig = f"{geojson_file.name}:{geojson_file.size}"
-                if gj_sig != st.session_state.get("last_geojson_sig", ""):
-                    try:
-                        payload = json.loads(geojson_file.getvalue().decode("utf-8"))
-                        gj_bbox = _extract_bbox_from_geojson(payload)
-                        if gj_bbox is not None:
-                            st.session_state["last_geojson_sig"] = gj_sig
-                            _apply_bbox_to_state(gj_bbox)
-                        else:
-                            st.warning("Uploaded GeoJSON contained no valid coordinates.")
-                    except Exception as exc:
-                        st.error(f"Could not parse GeoJSON AOI: {exc}")
-
         with st.form("bbox_coords_form", border=False):
             col_w, col_s = st.columns(2)
             west = col_w.number_input(
@@ -2406,6 +2329,7 @@ def main() -> None:
                     use_frp=use_frp,
                     harmonized_cells_df=result.harmonized_cells_df,
                 ),
+                key="live_daily_chart_tab1",
                 width="stretch",
                 config=PLOTLY_CONFIG,
             )
@@ -2444,6 +2368,7 @@ def main() -> None:
                     metric_label=metric_label,
                     color_scale_mode=color_scale_mode,
                 ),
+                key="calendar_heatmap_tab1",
                 width="stretch",
                 config=PLOTLY_CONFIG,
             )
@@ -2480,6 +2405,7 @@ def main() -> None:
                         metric_label=metric_label,
                         accent_color=COLOR_PALETTES[palette_name]["accent"],
                     ),
+                    key="seasonal_profile_tab1",
                     width="stretch",
                     config=PLOTLY_CONFIG,
                 )
@@ -2490,6 +2416,7 @@ def main() -> None:
                         target_year=selected_year,
                         mode=anom_metric_mode,
                     ),
+                    key="anomaly_bar_tab1",
                     width="stretch",
                     config=PLOTLY_CONFIG,
                 )
@@ -2552,6 +2479,7 @@ def main() -> None:
                 )
                 st.plotly_chart(
                     _make_critical_windows_chart(crit_df),
+                    key="critical_windows_tab1",
                     width="stretch",
                     config=PLOTLY_CONFIG,
                 )
@@ -2566,6 +2494,7 @@ def main() -> None:
                     use_frp=use_frp,
                     harmonized_cells_df=result.harmonized_cells_df,
                 ),
+                key="live_daily_chart_tab2",
                 width="stretch",
                 config=PLOTLY_CONFIG,
             )
@@ -2606,6 +2535,7 @@ def main() -> None:
                         use_frp=use_frp,
                         harmonized_cells_df=result.harmonized_cells_df,
                     ),
+                    key="live_daily_chart_tab2",
                     width="stretch",
                     config=PLOTLY_CONFIG,
                 )
@@ -2625,6 +2555,7 @@ def main() -> None:
                     granularity=granularity,
                     use_frp=use_frp,
                 ),
+                key="raw_vs_harmonized_tab2",
                 width="stretch",
                 config=PLOTLY_CONFIG,
             )
@@ -2710,12 +2641,14 @@ def main() -> None:
             with s_col1:
                 st.plotly_chart(
                     _make_overlap_scatter(result.overlap_monthly_df, tm),
+                    key="overlap_scatter_tab2",
                     width="stretch",
                     config=PLOTLY_CONFIG,
                 )
             with s_col2:
                 st.plotly_chart(
                     _make_alpha_bar_chart(result.calibration_df),
+                    key="alpha_bar_tab2",
                     width="stretch",
                     config=PLOTLY_CONFIG,
                 )
@@ -2727,34 +2660,14 @@ def main() -> None:
     with tab3:
         st.markdown(
             f"Inspect harmonized 0.01° cells alongside external OGC WMS overlays "
-            f"([NASA FIRMS]({FIRMS_PORTAL_URL}) / [Global Fire Map]({FIRMS_MAP_URL})"
-            + (
-                f", [CONAE OGC]({CONAE_CATALOG_OGC_URL}), [CONAE Focos]({CONAE_FOCOS_URL}))."
-                if not is_explore_mode
-                else ")."
-            )
+            f"([NASA FIRMS]({FIRMS_PORTAL_URL}) / [Global Fire Map]({FIRMS_MAP_URL}))."
         )
-        if not is_explore_mode:
-            b1, b2 = st.columns(2)
-            b1.link_button(
-                "🌐 Compare in Official NASA FIRMS Fire Map",
-                firms_compare_url,
-                width="stretch",
-                help="Open this exact region and zoom level on NASA FIRMS Official Fire Map.",
-            )
-            b2.link_button(
-                "🛰️ Open Official CONAE Geoportal",
-                CONAE_FOCOS_URL,
-                width="stretch",
-                help="Open Argentina's CONAE Focos de Calor active-fire viewer.",
-            )
-        else:
-            st.link_button(
-                "🌐 Compare in Official NASA FIRMS Fire Map",
-                firms_compare_url,
-                width="stretch",
-                help="Open this exact region and zoom level on NASA FIRMS Official Fire Map.",
-            )
+        st.link_button(
+            "🌐 Compare in Official NASA FIRMS Fire Map",
+            firms_compare_url,
+            width="stretch",
+            help="Open this exact region and zoom level on NASA FIRMS Official Fire Map.",
+        )
 
         f1, f2 = st.columns(2)
         map_years = ["All Years"] + sorted(result.gridded_df["year"].unique().tolist(), reverse=True)
