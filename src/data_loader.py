@@ -17,7 +17,7 @@ import zipfile
 from datetime import date, timedelta
 from io import StringIO
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 import numpy as np
 import pandas as pd
@@ -91,7 +91,11 @@ def detect_sensor_type(df: pd.DataFrame) -> str:
     return "MODIS"
 
 
-def _normalize_common_columns(df: pd.DataFrame) -> pd.DataFrame:
+def _normalize_common_columns(
+    df: pd.DataFrame,
+    dayfirst: bool = False,
+    return_report: bool = False,
+) -> pd.DataFrame | tuple[pd.DataFrame, dict[str, Any]]:
     """Standardize coordinate, date, time, FRP, and daynight columns on a FIRMS dataframe."""
     out = df.copy()
     out.columns = [str(c).strip().lower() for c in out.columns]
@@ -99,13 +103,39 @@ def _normalize_common_columns(df: pd.DataFrame) -> pd.DataFrame:
     required_base = {"latitude", "longitude", "acq_date", "frp"}
     missing = required_base - set(out.columns)
     if missing:
-        raise ValueError(f"Missing required FIRMS columns: {sorted(missing)}")
+        found_cols = sorted(str(c) for c in out.columns)
+        raise ValueError(
+            f"Missing required FIRMS columns: {sorted(missing)}. "
+            f"Found columns: {found_cols}"
+        )
 
+    rows_read = int(len(out))
     if out.empty:
-        return out
+        empty_report: dict[str, Any] = {
+            "rows_read": 0,
+            "rows_kept": 0,
+            "rows_dropped_coords": 0,
+            "rows_dropped_dates": 0,
+            "date_min": None,
+            "date_max": None,
+            "data_bbox": None,
+        }
+        return (out, empty_report) if return_report else out
 
-    out["latitude"] = pd.to_numeric(out["latitude"], errors="coerce")
-    out["longitude"] = pd.to_numeric(out["longitude"], errors="coerce")
+    lat = pd.to_numeric(out["latitude"], errors="coerce")
+    lon = pd.to_numeric(out["longitude"], errors="coerce")
+    out["latitude"] = lat
+    out["longitude"] = lon
+    coord_mask = (
+        lat.notna()
+        & lon.notna()
+        & (lat >= -90.0)
+        & (lat <= 90.0)
+        & (lon >= -180.0)
+        & (lon <= 180.0)
+    )
+    rows_dropped_coords = int((~coord_mask).sum())
+
     out["frp"] = pd.to_numeric(out["frp"], errors="coerce").fillna(0.0).clip(lower=0.0)
     for col in ("scan", "track"):
         if col in out.columns:
@@ -113,8 +143,20 @@ def _normalize_common_columns(df: pd.DataFrame) -> pd.DataFrame:
         else:
             out[col] = 1.0
 
-    out["acq_date"] = pd.to_datetime(out["acq_date"], errors="coerce").dt.strftime("%Y-%m-%d")
-    out = out.dropna(subset=["latitude", "longitude", "acq_date"])
+    raw_dates = out["acq_date"].astype(str).str.strip()
+    parsed_dates = pd.to_datetime(raw_dates, format="%Y-%m-%d", errors="coerce")
+    na_mask = parsed_dates.isna()
+    if na_mask.any():
+        parsed_fallback = pd.to_datetime(
+            raw_dates[na_mask], dayfirst=dayfirst, errors="coerce"
+        )
+        parsed_dates = parsed_dates.where(~na_mask, parsed_fallback)
+
+    rows_dropped_dates = int((coord_mask & parsed_dates.isna()).sum())
+    valid_mask = coord_mask & parsed_dates.notna()
+
+    out = out.loc[valid_mask].copy()
+    out["acq_date"] = parsed_dates.loc[valid_mask].dt.strftime("%Y-%m-%d")
 
     if "acq_time" in out.columns:
         out["acq_time"] = (
@@ -141,7 +183,30 @@ def _normalize_common_columns(df: pd.DataFrame) -> pd.DataFrame:
         hours = pd.to_numeric(out["acq_time"].str[:2], errors="coerce").fillna(12)
         out["daynight"] = np.where((hours >= 6) & (hours < 18), "D", "N")
 
-    return out
+    if not out.empty:
+        data_bbox = (
+            round(float(out["longitude"].min()), 4),
+            round(float(out["latitude"].min()), 4),
+            round(float(out["longitude"].max()), 4),
+            round(float(out["latitude"].max()), 4),
+        )
+        date_min = str(out["acq_date"].min())
+        date_max = str(out["acq_date"].max())
+    else:
+        data_bbox = None
+        date_min = None
+        date_max = None
+
+    report: dict[str, Any] = {
+        "rows_read": rows_read,
+        "rows_kept": int(len(out)),
+        "rows_dropped_coords": rows_dropped_coords,
+        "rows_dropped_dates": rows_dropped_dates,
+        "date_min": date_min,
+        "date_max": date_max,
+        "data_bbox": data_bbox,
+    }
+    return (out, report) if return_report else out
 
 
 def split_modis_and_viirs(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -159,24 +224,131 @@ def split_modis_and_viirs(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]
     return modis_df, viirs_df
 
 
-def load_csv_dataset(
+def _get_source_size_bytes(item: Any) -> Optional[int]:
+    """Return file/buffer size in bytes when available."""
+    if isinstance(item, (str, Path)):
+        p = Path(item)
+        return p.stat().st_size if p.exists() else None
+    size_attr = getattr(item, "size", None)
+    if isinstance(size_attr, (int, float)):
+        return int(size_attr)
+    if hasattr(item, "seek") and hasattr(item, "tell"):
+        pos = item.tell()
+        item.seek(0, os.SEEK_END)
+        end_pos = item.tell()
+        item.seek(pos)
+        return int(end_pos)
+    return None
+
+
+def _detect_csv_delimiter(item: Any) -> str:
+    """Detect whether a CSV path or buffer uses ';' or ',' as delimiter."""
+    first_line = ""
+    if isinstance(item, (str, Path)):
+        with Path(item).open("r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if line.strip():
+                    first_line = line
+                    break
+    elif hasattr(item, "read"):
+        if hasattr(item, "seek"):
+            item.seek(0)
+        head_raw = item.read(4096)
+        if isinstance(head_raw, bytes):
+            head_str = head_raw.decode("utf-8", errors="replace")
+        else:
+            head_str = str(head_raw)
+        for line in head_str.splitlines():
+            if line.strip():
+                first_line = line
+                break
+        if hasattr(item, "seek"):
+            item.seek(0)
+
+    if ";" in first_line and "," not in first_line:
+        return ";"
+    return ","
+
+
+def _read_csv_flexible(item: Any, max_size_mb: float = 200.0) -> pd.DataFrame:
+    """Read a FIRMS CSV from path or file-like stream with size guards and ';' detection."""
+    size_bytes = _get_source_size_bytes(item)
+    if size_bytes is not None:
+        size_mb = size_bytes / (1024.0 * 1024.0)
+        if size_mb > max_size_mb:
+            raise ValueError(
+                f"CSV file is too large ({size_mb:.1f} MB exceeds {max_size_mb:.0f} MB limit). "
+                "Filter your request to a smaller bounding box or date range in NASA FIRMS Archive Download."
+            )
+
+    sep = _detect_csv_delimiter(item)
+    if hasattr(item, "seek"):
+        item.seek(0)
+
+    use_chunks = size_bytes is not None and size_bytes > 25 * 1024 * 1024
+    try:
+        if use_chunks:
+            chunk_iter = pd.read_csv(
+                item, sep=sep, chunksize=100_000, low_memory=False
+            )
+            parts = [chunk for chunk in chunk_iter]
+            if not parts:
+                raise ValueError("CSV file is empty (no columns or rows found).")
+            df = pd.concat(parts, ignore_index=True)
+        else:
+            df = pd.read_csv(item, sep=sep, low_memory=False)
+    except pd.errors.EmptyDataError:
+        raise ValueError("CSV file is empty (no columns or rows found).") from None
+
+    if len(df.columns) == 0:
+        raise ValueError("CSV file is empty (no columns or rows found).")
+    return df
+
+
+def load_csv_dataset_with_report(
     source: str | Path | Iterable[str | Path],
     sensor_hint: Optional[str] = None,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Load one or more FIRMS CSV files (path or file-like buffer) and return (modis_df, viirs_df)."""
+    dayfirst: bool = False,
+    max_size_mb: float = 200.0,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+    """Load FIRMS CSV files and return (modis_df, viirs_df, load_report)."""
     sources = [source] if isinstance(source, (str, Path)) or hasattr(source, "read") else list(source)
 
     modis_frames: list[pd.DataFrame] = []
     viirs_frames: list[pd.DataFrame] = []
+    total_read = 0
+    total_kept = 0
+    total_dropped_coords = 0
+    total_dropped_dates = 0
+    total_size_bytes = 0
+    file_names: list[str] = []
+    delimiters: list[str] = []
 
-    for item in sources:
+    for idx, item in enumerate(sources):
+        item_name = (
+            Path(item).name
+            if isinstance(item, (str, Path))
+            else str(getattr(item, "name", f"uploaded_{idx + 1}.csv"))
+        )
+        file_names.append(item_name)
+        size_b = _get_source_size_bytes(item)
+        if size_b is not None:
+            total_size_bytes += int(size_b)
+        delimiters.append(_detect_csv_delimiter(item))
         if hasattr(item, "seek"):
             item.seek(0)
-        raw_df = pd.read_csv(item)
-        if raw_df.empty:
+        raw_df = _read_csv_flexible(item, max_size_mb=max_size_mb)
+        norm, file_rep = _normalize_common_columns(
+            raw_df, dayfirst=dayfirst, return_report=True
+        )
+        total_read += int(file_rep["rows_read"])
+        total_kept += int(file_rep["rows_kept"])
+        total_dropped_coords += int(file_rep["rows_dropped_coords"])
+        total_dropped_dates += int(file_rep["rows_dropped_dates"])
+
+        if norm.empty:
             continue
 
-        norm = _normalize_common_columns(raw_df)
         sensor = sensor_hint.upper() if sensor_hint else detect_sensor_type(norm)
         if sensor == "MODIS":
             modis_frames.append(norm)
@@ -198,6 +370,56 @@ def load_csv_dataset(
         pd.concat(viirs_frames, ignore_index=True)
         if viirs_frames
         else pd.DataFrame(columns=VIIRS_COLUMNS)
+    )
+
+    combined = pd.concat(
+        [
+            modis_df[["latitude", "longitude", "acq_date"]] if not modis_df.empty else pd.DataFrame(),
+            viirs_df[["latitude", "longitude", "acq_date"]] if not viirs_df.empty else pd.DataFrame(),
+        ],
+        ignore_index=True,
+    )
+    if not combined.empty:
+        data_bbox = (
+            round(float(combined["longitude"].min()), 4),
+            round(float(combined["latitude"].min()), 4),
+            round(float(combined["longitude"].max()), 4),
+            round(float(combined["latitude"].max()), 4),
+        )
+        date_min = str(combined["acq_date"].min())
+        date_max = str(combined["acq_date"].max())
+    else:
+        data_bbox = None
+        date_min = None
+        date_max = None
+
+    report: dict[str, Any] = {
+        "files_loaded": file_names,
+        "total_size_bytes": int(total_size_bytes),
+        "delimiters": sorted(set(delimiters)),
+        "rows_read": total_read,
+        "rows_kept": total_kept,
+        "rows_dropped_coords": total_dropped_coords,
+        "rows_dropped_dates": total_dropped_dates,
+        "modis_rows": int(len(modis_df)),
+        "viirs_rows": int(len(viirs_df)),
+        "date_min": date_min,
+        "date_max": date_max,
+        "data_bbox": data_bbox,
+    }
+    return modis_df, viirs_df, report
+
+
+def load_csv_dataset(
+    source: str | Path | Iterable[str | Path],
+    sensor_hint: Optional[str] = None,
+    dayfirst: bool = False,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Load one or more FIRMS CSV files (path or file-like buffer) and return (modis_df, viirs_df)."""
+    modis_df, viirs_df, _ = load_csv_dataset_with_report(
+        source=source,
+        sensor_hint=sensor_hint,
+        dayfirst=dayfirst,
     )
     return modis_df, viirs_df
 
@@ -269,15 +491,90 @@ def _safe_http_error(prefix: str, exc: requests.RequestException) -> str:
     )
 
 
+def _is_rate_limit_response(status_code: Optional[int], text: str) -> bool:
+    """Return True if an HTTP status or response body signals FIRMS transaction rate limiting."""
+    lower = (text or "").lower()
+    if "exceeding allowed transaction limit" in lower or "transaction limit" in lower:
+        return True
+    if status_code in (429, 503):
+        return True
+    return False
+
+
+def _validate_firms_csv_text(
+    text: str,
+    required_cols: tuple[str, ...] = ("latitude", "acq_date"),
+) -> tuple[bool, bool, str]:
+    """Validate that an API or cached payload is a legitimate FIRMS CSV.
+
+    Returns ``(is_valid, has_data_rows, error_reason)``.
+    A header-only CSV (valid columns, 0 data rows) is valid with ``has_data_rows=False``.
+    Rate-limit notices, HTML pages, Invalid MAP_KEY errors, empty bodies, or arbitrary
+    non-CSV text are rejected with ``is_valid=False``.
+    """
+    stripped = (text or "").strip()
+    if not stripped:
+        return False, False, "FIRMS API returned an empty response."
+
+    head_lower = stripped[:500].lower()
+    if _is_rate_limit_response(None, stripped):
+        return False, False, "FIRMS API transaction rate limit exceeded."
+    if (
+        head_lower.startswith("<")
+        or "<html" in head_lower
+        or "<!doctype" in head_lower
+    ):
+        return False, False, "FIRMS API returned HTML instead of CSV."
+    if (
+        "invalid map_key" in stripped.lower()
+        or head_lower.startswith("invalid")
+        or head_lower.startswith("error")
+    ):
+        first_line = stripped.splitlines()[0].strip()
+        return False, False, f"FIRMS API error response: {first_line[:160]}"
+
+    lines = [ln.strip() for ln in stripped.splitlines() if ln.strip()]
+    if not lines:
+        return False, False, "FIRMS API returned an empty response."
+
+    header_line = lines[0].lstrip("\ufeff").lower()
+    cols = {
+        tok.strip().strip('"').strip("'")
+        for tok in header_line.replace(";", ",").split(",")
+        if tok.strip()
+    }
+    missing = [req for req in required_cols if req not in cols]
+    if missing:
+        return (
+            False,
+            False,
+            f"Invalid FIRMS CSV header (missing {missing}; got: {lines[0][:160]}).",
+        )
+
+    return True, len(lines) > 1, ""
+
+
 def _cache_is_fresh(
     cache_path: Path,
     date_str: str,
     day_range: int,
     nrt_ttl_seconds: int = 3 * 3600,
 ) -> bool:
-    """Return True if cached FIRMS CSV exists and is fresh (3-hour TTL for recent NRT dates)."""
+    """Return True if cached FIRMS CSV exists, has a valid CSV header, and is fresh."""
     if not cache_path.exists():
         return False
+    try:
+        cached_text = cache_path.read_text(encoding="utf-8", errors="replace")
+        is_valid, _, _ = _validate_firms_csv_text(
+            cached_text, required_cols=("latitude", "acq_date")
+        )
+        if not is_valid:
+            cache_path.unlink(missing_ok=True)
+            return False
+    except Exception:
+        cache_path.unlink(missing_ok=True)
+        return False
+
     try:
         start_dt = date.fromisoformat(str(date_str)[:10])
         end_dt = start_dt + timedelta(days=max(int(day_range) - 1, 0))
@@ -297,11 +594,18 @@ class FIRMSApiClient:
         map_key: Optional[str] = None,
         cache_dir: Path = RAW_DIR,
         timeout: int = 30,
+        max_retries: int = 4,
+        backoff_base: float = 0.5,
+        sleep_fn: Callable[[float], None] = time.sleep,
     ) -> None:
         self.map_key = _resolve_firms_map_key(map_key)
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.timeout = timeout
+        self.max_retries = max(1, int(max_retries))
+        self.backoff_base = float(backoff_base)
+        self.sleep_fn = sleep_fn
+        self.last_failed_windows: list[dict[str, str]] = []
 
     def _require_map_key(self) -> str:
         if not self.map_key or self.map_key == "your_firms_map_key_here":
@@ -311,22 +615,51 @@ class FIRMSApiClient:
             )
         return self.map_key
 
+    def _request_with_retry(self, url: str, err_prefix: str) -> requests.Response:
+        """Perform GET request with exponential backoff on transaction rate limits."""
+        for attempt in range(self.max_retries):
+            try:
+                resp = requests.get(url, timeout=self.timeout)
+                body_text = resp.text or ""
+                if _is_rate_limit_response(resp.status_code, body_text):
+                    if attempt < self.max_retries - 1:
+                        self.sleep_fn(self.backoff_base * (2 ** attempt))
+                        continue
+                    raise FIRMSApiError(
+                        "FIRMS API transaction rate limit exceeded after retries. "
+                        "Wait a few minutes or reduce the requested date window."
+                    )
+                resp.raise_for_status()
+                return resp
+            except requests.RequestException as exc:
+                resp_obj = getattr(exc, "response", None)
+                status_code = getattr(resp_obj, "status_code", None)
+                resp_body = getattr(resp_obj, "text", "") or ""
+                if _is_rate_limit_response(status_code, resp_body):
+                    if attempt < self.max_retries - 1:
+                        self.sleep_fn(self.backoff_base * (2 ** attempt))
+                        continue
+                    raise FIRMSApiError(
+                        "FIRMS API transaction rate limit exceeded after retries. "
+                        "Wait a few minutes or reduce the requested date window."
+                    ) from None
+                raise FIRMSApiError(_safe_http_error(err_prefix, exc)) from None
+
+        raise FIRMSApiError(f"{err_prefix}: maximum retries exhausted.")
+
     def check_data_availability(self, sensor: str = "ALL") -> pd.DataFrame:
         """Query FIRMS Data Availability API for valid date ranges per sensor."""
         key = self._require_map_key()
         url = FIRMS_AVAILABILITY_API_URL.format(map_key=key, sensor=sensor)
-        try:
-            resp = requests.get(url, timeout=self.timeout)
-            resp.raise_for_status()
-        except requests.RequestException as exc:
-            raise FIRMSApiError(
-                _safe_http_error("FIRMS Data Availability request failed", exc)
-            ) from None
-
+        resp = self._request_with_retry(url, "FIRMS Data Availability request failed")
         text = resp.text.strip()
-        if not text or text.lower().startswith("invalid"):
-            raise FIRMSApiError(f"FIRMS API returned an error response: {text[:200]}")
-
+        is_valid, has_rows, reason = _validate_firms_csv_text(
+            text, required_cols=("data_id",)
+        )
+        if not is_valid:
+            raise FIRMSApiError(reason)
+        if not has_rows:
+            return pd.DataFrame(columns=["data_id", "min_date", "max_date", "data_version"])
         return pd.read_csv(StringIO(text))
 
     def fetch_area_csv(
@@ -337,7 +670,7 @@ class FIRMSApiClient:
         target_date: Optional[str] = None,
         use_cache: bool = True,
     ) -> pd.DataFrame:
-        """Fetch active fire records from FIRMS Area API and cache raw CSV on E:\\.
+        """Fetch active fire records from FIRMS Area API and cache validated CSVs on E:\\.
 
         Parameters
         ----------
@@ -362,9 +695,16 @@ class FIRMSApiClient:
             f"firms_{source}_{west}_{south}_{east}_{north}_d{day_range}_{date_str}.csv"
         )
         cache_path = self.cache_dir / cache_name
+        cols = MODIS_COLUMNS if FIRMS_SOURCES[source]["sensor"] == "MODIS" else VIIRS_COLUMNS
 
         if use_cache and _cache_is_fresh(cache_path, date_str, int(day_range)):
-            return _normalize_common_columns(pd.read_csv(cache_path))
+            cached_text = cache_path.read_text(encoding="utf-8", errors="replace").strip()
+            _, has_rows, _ = _validate_firms_csv_text(
+                cached_text, required_cols=("latitude", "acq_date")
+            )
+            if not has_rows:
+                return pd.DataFrame(columns=cols)
+            return _normalize_common_columns(pd.read_csv(StringIO(cached_text)))
 
         url = FIRMS_AREA_API_URL.format(
             map_key=key,
@@ -376,21 +716,16 @@ class FIRMSApiClient:
             day_range=int(day_range),
             date=date_str,
         )
-        try:
-            resp = requests.get(url, timeout=self.timeout)
-            resp.raise_for_status()
-        except requests.RequestException as exc:
-            raise FIRMSApiError(
-                _safe_http_error("FIRMS Area API request failed", exc)
-            ) from None
-
+        resp = self._request_with_retry(url, "FIRMS Area API request failed")
         text = resp.text.strip()
-        if text.lower().startswith("invalid"):
-            raise FIRMSApiError(f"FIRMS API error: {text[:200]}")
+        is_valid, has_rows, reason = _validate_firms_csv_text(
+            text, required_cols=("latitude", "acq_date")
+        )
+        if not is_valid:
+            raise FIRMSApiError(reason)
 
         cache_path.write_text(text, encoding="utf-8")
-        if not text or "\n" not in text:
-            cols = MODIS_COLUMNS if FIRMS_SOURCES[source]["sensor"] == "MODIS" else VIIRS_COLUMNS
+        if not has_rows:
             return pd.DataFrame(columns=cols)
         return _normalize_common_columns(pd.read_csv(StringIO(text)))
 
@@ -401,27 +736,48 @@ class FIRMSApiClient:
         start_date: str,
         end_date: str,
         use_cache: bool = True,
+        allow_partial: bool = False,
     ) -> pd.DataFrame:
-        """Fetch multi-day range by chunking into 5-day FIRMS Area API windows."""
+        """Fetch multi-day range by chunking into 5-day FIRMS Area API windows.
+
+        Tracks any failed 5-day sub-windows in ``self.last_failed_windows`` so callers
+        can surface warnings instead of silently treating missing responses as zero fires.
+        """
         start_dt = date.fromisoformat(start_date)
         end_dt = date.fromisoformat(end_date)
         if end_dt < start_dt:
             raise ValueError("end_date must be >= start_date")
 
+        self.last_failed_windows = []
         chunks: list[pd.DataFrame] = []
         cursor = start_dt
         while cursor <= end_dt:
             remaining = (end_dt - cursor).days + 1
             span = min(5, remaining)
-            df_chunk = self.fetch_area_csv(
-                source=source,
-                bbox=bbox,
-                day_range=span,
-                target_date=cursor.strftime("%Y-%m-%d"),
-                use_cache=use_cache,
-            )
-            if not df_chunk.empty:
-                chunks.append(df_chunk)
+            chunk_start_str = cursor.strftime("%Y-%m-%d")
+            chunk_end_str = (cursor + timedelta(days=span - 1)).strftime("%Y-%m-%d")
+            try:
+                df_chunk = self.fetch_area_csv(
+                    source=source,
+                    bbox=bbox,
+                    day_range=span,
+                    target_date=chunk_start_str,
+                    use_cache=use_cache,
+                )
+                if not df_chunk.empty:
+                    chunks.append(df_chunk)
+            except FIRMSApiError as exc:
+                self.last_failed_windows.append(
+                    {
+                        "source": source,
+                        "start_date": chunk_start_str,
+                        "end_date": chunk_end_str,
+                        "days": str(span),
+                        "error": str(exc),
+                    }
+                )
+                if not allow_partial:
+                    raise
             cursor += timedelta(days=span)
 
         if not chunks:
@@ -504,8 +860,8 @@ def generate_regional_sample_data(
 
     SAMPLE_DIR.mkdir(parents=True, exist_ok=True)
     viirs_start_year = max(start_year, 2012)
-    modis_path = SAMPLE_DIR / f"modis_{region_key}_{start_year}_{end_year}.csv"
-    viirs_path = SAMPLE_DIR / f"viirs_{region_key}_{viirs_start_year}_{end_year}.csv"
+    modis_path = SAMPLE_DIR / f"synthetic_modis_{region_key}_{start_year}_{end_year}.csv"
+    viirs_path = SAMPLE_DIR / f"synthetic_viirs_{region_key}_{viirs_start_year}_{end_year}.csv"
 
     if not force and modis_path.exists() and viirs_path.exists():
         return pd.read_csv(modis_path, dtype={"acq_time": str}), pd.read_csv(
@@ -755,8 +1111,8 @@ def generate_all_sample_datasets(force: bool = False) -> dict[str, dict[str, obj
             "modis_span": (modis_df["acq_date"].min(), modis_df["acq_date"].max()),
             "viirs_span": (viirs_df["acq_date"].min(), viirs_df["acq_date"].max()),
             "post2012_raw_viirs_to_modis_ratio": round(raw_ratio, 2),
-            "modis_file": str(SAMPLE_DIR / f"modis_{region_key}_2001_2026.csv"),
-            "viirs_file": str(SAMPLE_DIR / f"viirs_{region_key}_2012_2026.csv"),
+            "modis_file": str(SAMPLE_DIR / f"synthetic_modis_{region_key}_2001_2026.csv"),
+            "viirs_file": str(SAMPLE_DIR / f"synthetic_viirs_{region_key}_2012_2026.csv"),
         }
     return summary
 

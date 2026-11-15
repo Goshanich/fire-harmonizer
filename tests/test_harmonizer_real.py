@@ -33,11 +33,14 @@ def test_real_cordoba_harmonization_and_oos_metrics() -> None:
 
     assert tm["has_valid_overlap"] is True
     assert 0.0 < tm["mean_alpha_night"] < tm["mean_alpha_day"] < 1.0
-    assert tm["overlap_r2"] > 0.90
-    assert tm["deseasonalized_anomaly_r"] > 0.90
+    assert abs(tm["overlap_sensor_residual_bias_pct"]) <= 0.5
+    assert abs(tm["harmonized_diff_pct"] - tm["modis_natural_change_pct"]) <= 1.0
+    assert tm["overlap_r2"] >= 0.95
+    assert tm["deseasonalized_anomaly_r"] >= 0.95
     assert tm["jump_reduction_pct"] > 70.0
     assert -30.0 <= tm["holdout_bias_pct"] <= 30.0
     assert not bool(res.calibration_df["used_fallback"].all())
+    assert not ((res.calibration_df["alpha_ci_low"] == 0.1) & (res.calibration_df["alpha_ci_high"] == 0.1)).any()
 
 
 def test_no_overlap_pre2012_window_flagged() -> None:
@@ -78,7 +81,7 @@ def test_firms_api_5day_limit_and_secret_redaction() -> None:
 def test_synthetic_modis_terra_only_before_aqua_launch() -> None:
     import pandas as pd
 
-    modis_sample = SAMPLE_DIR / "modis_cordoba_argentina_2001_2026.csv"
+    modis_sample = SAMPLE_DIR / "synthetic_modis_cordoba_argentina_2001_2026.csv"
     df = pd.read_csv(modis_sample, usecols=["acq_date", "satellite"])
     pre_aqua = df[df["acq_date"] < "2002-07-04"]
     assert not pre_aqua.empty

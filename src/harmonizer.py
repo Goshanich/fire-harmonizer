@@ -100,26 +100,30 @@ def unify_and_filter_sensors(
             m = m[m["daynight"] == daynight_filter]
 
         if not m.empty:
-            conf_num = pd.to_numeric(m.get("confidence", 50), errors="coerce").fillna(0.0)
+            conf_num = pd.to_numeric(
+                m.get("confidence", pd.Series(50.0, index=m.index)), errors="coerce"
+            ).fillna(0.0)
             m = m[conf_num >= float(modis_min_conf)].copy()
             if not m.empty:
-                conf_kept = pd.to_numeric(m.get("confidence", 50), errors="coerce").fillna(50.0)
+                conf_kept = pd.to_numeric(
+                    m.get("confidence", pd.Series(50.0, index=m.index)), errors="coerce"
+                ).fillna(50.0)
                 bright_col = "brightness" if "brightness" in m.columns else "bright_ti4"
                 m_out = pd.DataFrame(
                     {
                         "latitude": pd.to_numeric(m["latitude"], errors="coerce"),
                         "longitude": pd.to_numeric(m["longitude"], errors="coerce"),
                         "acq_date": m["acq_date"].astype(str),
-                        "acq_time": m.get("acq_time", "1200").astype(str).str.zfill(4),
-                        "daynight": m.get("daynight", "D").astype(str).str.upper(),
-                        "scan": pd.to_numeric(m.get("scan", 1.0), errors="coerce").fillna(1.0),
-                        "track": pd.to_numeric(m.get("track", 1.0), errors="coerce").fillna(1.0),
-                        "frp": pd.to_numeric(m["frp"], errors="coerce").fillna(0.0).clip(lower=0.0),
-                        "brightness_k": pd.to_numeric(m.get(bright_col, np.nan), errors="coerce"),
+                        "acq_time": m.get("acq_time", pd.Series("1200", index=m.index)).astype(str).str.zfill(4),
+                        "daynight": m.get("daynight", pd.Series("D", index=m.index)).astype(str).str.upper(),
+                        "scan": pd.to_numeric(m.get("scan", pd.Series(1.0, index=m.index)), errors="coerce").fillna(1.0),
+                        "track": pd.to_numeric(m.get("track", pd.Series(1.0, index=m.index)), errors="coerce").fillna(1.0),
+                        "frp": pd.to_numeric(m.get("frp", pd.Series(0.0, index=m.index)), errors="coerce").fillna(0.0).clip(lower=0.0),
+                        "brightness_k": pd.to_numeric(m.get(bright_col, pd.Series(np.nan, index=m.index)), errors="coerce"),
                         "confidence_raw": conf_kept.astype(int).astype(str),
                         "confidence_weight": np.clip(conf_kept / 100.0, 0.0, 1.0),
                         "sensor_group": "MODIS",
-                        "satellite": m.get("satellite", "Terra/Aqua").astype(str),
+                        "satellite": m.get("satellite", pd.Series("Terra/Aqua", index=m.index)).astype(str),
                         "instrument": "MODIS",
                     }
                 )
@@ -144,16 +148,16 @@ def unify_and_filter_sensors(
                         "latitude": pd.to_numeric(v["latitude"], errors="coerce"),
                         "longitude": pd.to_numeric(v["longitude"], errors="coerce"),
                         "acq_date": v["acq_date"].astype(str),
-                        "acq_time": v.get("acq_time", "1200").astype(str).str.zfill(4),
-                        "daynight": v.get("daynight", "D").astype(str).str.upper(),
-                        "scan": pd.to_numeric(v.get("scan", 0.45), errors="coerce").fillna(0.45),
-                        "track": pd.to_numeric(v.get("track", 0.45), errors="coerce").fillna(0.45),
-                        "frp": pd.to_numeric(v["frp"], errors="coerce").fillna(0.0).clip(lower=0.0),
-                        "brightness_k": pd.to_numeric(v.get(bright_col, np.nan), errors="coerce"),
+                        "acq_time": v.get("acq_time", pd.Series("1200", index=v.index)).astype(str).str.zfill(4),
+                        "daynight": v.get("daynight", pd.Series("D", index=v.index)).astype(str).str.upper(),
+                        "scan": pd.to_numeric(v.get("scan", pd.Series(0.45, index=v.index)), errors="coerce").fillna(0.45),
+                        "track": pd.to_numeric(v.get("track", pd.Series(0.45, index=v.index)), errors="coerce").fillna(0.45),
+                        "frp": pd.to_numeric(v.get("frp", pd.Series(0.0, index=v.index)), errors="coerce").fillna(0.0).clip(lower=0.0),
+                        "brightness_k": pd.to_numeric(v.get(bright_col, pd.Series(np.nan, index=v.index)), errors="coerce"),
                         "confidence_raw": conf_kept,
                         "confidence_weight": conf_kept.map(VIIRS_CONFIDENCE_WEIGHTS).fillna(0.75),
                         "sensor_group": "VIIRS",
-                        "satellite": v.get("satellite", "SNPP").astype(str),
+                        "satellite": v.get("satellite", pd.Series("SNPP", index=v.index)).astype(str),
                         "instrument": "VIIRS",
                     }
                 )
@@ -249,40 +253,54 @@ def grid_spatiotemporal_clusters(
     return gridded[cols].sort_values(["acq_date", "sensor_group"]).reset_index(drop=True)
 
 
-def _bootstrap_median_ratio_ci(
+def _bootstrap_sum_ratio_ci(
     modis_vals: np.ndarray,
     viirs_vals: np.ndarray,
-    n_bootstrap: int = 100,
+    base_alpha: float,
+    shrink_weight: float,
+    n_bootstrap: int = 200,
     seed: int = 42,
 ) -> tuple[float, float]:
-    """Compute 95% bootstrap confidence interval for Median(MODIS) / Median(VIIRS)."""
+    """Compute 95% paired bootstrap CI for shrunk sum-ratio Sum(MODIS) / Sum(VIIRS).
+
+    Resamples paired ``(year, month)`` vectors together with the same index draw so
+    season/year covariance between MODIS and VIIRS is preserved.
+    """
     n = len(modis_vals)
-    if n < 2 or np.median(viirs_vals) <= 0:
-        ratio = float(np.median(modis_vals) / max(np.median(viirs_vals), 1e-6)) if n > 0 else 1.0
-        return ratio, ratio
+    if n < 3 or float(np.sum(viirs_vals)) <= 0.0:
+        return np.nan, np.nan
 
     rng = np.random.default_rng(seed)
     idx = rng.integers(0, n, size=(n_bootstrap, n))
-    m_med = np.median(modis_vals[idx], axis=1)
-    v_med = np.maximum(np.median(viirs_vals[idx], axis=1), 1e-6)
-    ratios = m_med / v_med
-    low, high = np.percentile(ratios, [2.5, 97.5])
-    return float(low), float(high)
+    b_modis = modis_vals[idx].sum(axis=1)
+    b_viirs = viirs_vals[idx].sum(axis=1)
+    valid = b_viirs > 0.0
+    if int(np.sum(valid)) < 5:
+        return np.nan, np.nan
+
+    ratios = b_modis[valid] / b_viirs[valid]
+    shrunk = shrink_weight * ratios + (1.0 - shrink_weight) * base_alpha
+    low = float(np.percentile(shrunk, 2.5))
+    high = float(np.percentile(shrunk, 97.5))
+    return low, high
 
 
 def compute_overlap_calibration(
     gridded_df: pd.DataFrame,
     overlap_years: tuple[int, int] = OVERLAP_YEARS,
-    n_bootstrap: int = 100,
+    n_bootstrap: int = 200,
     seed: int = 42,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, float]]:
-    """Step 4a: Derive monthly & day/night alpha(m, daynight) factors on overlap (2012–2025)."""
+    """Step 4a: Derive sum-ratio alpha(dn, m) factors with empirical-Bayes shrinkage on 2012–2025 overlap."""
     y_start, y_end = overlap_years
-    overlap_raw = gridded_df[
-        (gridded_df["acq_date"] >= VIIRS_TRANSITION_DATE)
-        & (gridded_df["year"] >= y_start)
-        & (gridded_df["year"] <= y_end)
-    ]
+    if gridded_df.empty:
+        overlap_raw = gridded_df.copy()
+    else:
+        overlap_raw = gridded_df[
+            (gridded_df["acq_date"] >= VIIRS_TRANSITION_DATE)
+            & (gridded_df["year"] >= y_start)
+            & (gridded_df["year"] <= y_end)
+        ]
 
     def _agg_sensor(sensor_name: str) -> pd.DataFrame:
         sub = overlap_raw[overlap_raw["sensor_group"] == sensor_name]
@@ -310,110 +328,29 @@ def compute_overlap_calibration(
     v_ov = _agg_sensor("VIIRS")
 
     paired = pd.merge(m_ov, v_ov, on=["year", "month", "daynight"], how="outer").fillna(0.0)
-    paired_valid = paired[paired["viirs_active_cells"] > 0].copy()
+    total_m_cells = float(paired["modis_active_cells"].sum()) if not paired.empty else 0.0
+    total_v_cells = float(paired["viirs_active_cells"].sum()) if not paired.empty else 0.0
+    has_valid_overlap = bool(not paired.empty and total_m_cells > 0.0 and total_v_cells > 0.0)
 
-    default_alpha_by_dn: dict[str, float] = {"D": 0.85, "N": 0.36}
-    default_alpha_overall: float = 0.60
-
-    def _safe_median_ratios(df_sub: pd.DataFrame) -> tuple[float, float, float]:
-        med_v_cells = float(np.median(df_sub["viirs_active_cells"]))
-        med_m_cells = float(np.median(df_sub["modis_active_cells"]))
-        a_cells = float(med_m_cells / max(med_v_cells, 1e-6))
-
-        med_m_frp = float(np.median(df_sub["modis_frp_sum"]))
-        med_v_frp = float(np.median(df_sub["viirs_frp_sum"]))
-        a_frp = float(med_m_frp / max(med_v_frp, 1e-6)) if med_m_frp > 0 and med_v_frp > 0 else a_cells
-
-        med_m_raw = float(np.median(df_sub["modis_raw_points"]))
-        med_v_raw = float(np.median(df_sub["viirs_raw_points"]))
-        r_raw = float(med_m_raw / max(med_v_raw, 1e-6)) if med_m_raw > 0 and med_v_raw > 0 else a_cells
-        return a_cells, a_frp, r_raw
-
-    # Global and day/night fallback ratios in case a specific (month, daynight) slice is sparse
-    coactive_all = paired_valid[paired_valid["modis_active_cells"] > 0]
-    has_global_modis = True
-    if (
-        not paired_valid.empty
-        and np.median(paired_valid["modis_active_cells"]) > 0
-        and np.median(paired_valid["viirs_active_cells"]) > 0
-    ):
-        global_alpha_cells, global_alpha_frp, global_raw_ratio = _safe_median_ratios(paired_valid)
-    elif (
-        len(coactive_all) >= 3
-        and np.median(coactive_all["modis_active_cells"]) > 0
-        and np.median(coactive_all["viirs_active_cells"]) > 0
-    ):
-        global_alpha_cells, global_alpha_frp, global_raw_ratio = _safe_median_ratios(coactive_all)
-    else:
-        has_global_modis = False
-        global_alpha_cells = default_alpha_overall
-        global_alpha_frp = default_alpha_overall
-        global_raw_ratio = default_alpha_overall
-
-    dn_fallbacks: dict[str, tuple[float, float, float]] = {}
-    for dn in ("D", "N"):
-        sub_dn = paired_valid[paired_valid["daynight"] == dn]
-        sub_dn_pos = sub_dn[sub_dn["modis_active_cells"] > 0]
-        if (
-            len(sub_dn) >= 3
-            and np.median(sub_dn["modis_active_cells"]) > 0
-            and np.median(sub_dn["viirs_active_cells"]) > 0
-        ):
-            dn_fallbacks[dn] = _safe_median_ratios(sub_dn)
-        elif (
-            len(sub_dn_pos) >= 3
-            and np.median(sub_dn_pos["modis_active_cells"]) > 0
-            and np.median(sub_dn_pos["viirs_active_cells"]) > 0
-        ):
-            dn_fallbacks[dn] = _safe_median_ratios(sub_dn_pos)
-        elif has_global_modis:
-            dn_fallbacks[dn] = (global_alpha_cells, global_alpha_frp, global_raw_ratio)
-        else:
-            d_val = default_alpha_by_dn[dn]
-            dn_fallbacks[dn] = (d_val, d_val, d_val)
-
-    cal_rows: list[dict[str, object]] = []
-    for month in range(1, 13):
-        for dn in ("D", "N"):
-            slice_df = paired_valid[
-                (paired_valid["month"] == month) & (paired_valid["daynight"] == dn)
-            ]
-            if (
-                len(slice_df) >= 3
-                and np.median(slice_df["modis_active_cells"]) > 0
-                and np.median(slice_df["viirs_active_cells"]) > 0
-            ):
-                m_cells = slice_df["modis_active_cells"].to_numpy(dtype=float)
-                v_cells = slice_df["viirs_active_cells"].to_numpy(dtype=float)
-                alpha_cells, alpha_frp, raw_ratio = _safe_median_ratios(slice_df)
-                ci_low, ci_high = _bootstrap_median_ratio_ci(
-                    m_cells, v_cells, n_bootstrap=n_bootstrap, seed=seed + month * 10 + (1 if dn == "N" else 0)
-                )
-                used_fallback = False
-            else:
-                alpha_cells, alpha_frp, raw_ratio = dn_fallbacks[dn]
-                ci_low, ci_high = alpha_cells, alpha_cells
-                used_fallback = True
-
-            cal_rows.append(
-                {
-                    "month": month,
-                    "daynight": dn,
-                    "alpha_cells": round(alpha_cells, 4),
-                    "alpha_ci_low": round(ci_low, 4),
-                    "alpha_ci_high": round(ci_high, 4),
-                    "alpha_frp": round(alpha_frp, 4),
-                    "raw_point_ratio": round(raw_ratio, 4),
-                    "overlap_samples": int(len(slice_df)),
-                    "used_fallback": used_fallback,
-                }
-            )
-
-    calibration_df = pd.DataFrame(cal_rows)
-
-    # Monthly (year, month) totals across day+night for scatter plot & correlation metrics
-    if paired.empty:
-        overlap_monthly = pd.DataFrame(
+    if not has_valid_overlap:
+        cal_rows = [
+            {
+                "month": month,
+                "daynight": dn,
+                "alpha_cells": 1.0,
+                "alpha_ci_low": np.nan,
+                "alpha_ci_high": np.nan,
+                "alpha_frp": 1.0,
+                "raw_point_ratio": 1.0,
+                "overlap_samples": 0,
+                "used_fallback": True,
+                "calibration_status": "no_data",
+            }
+            for month in range(1, 13)
+            for dn in ("D", "N")
+        ]
+        calibration_df = pd.DataFrame(cal_rows)
+        empty_ov = pd.DataFrame(
             columns=[
                 "year",
                 "month",
@@ -425,8 +362,168 @@ def compute_overlap_calibration(
                 "viirs_frp_sum",
             ]
         )
-    else:
-        overlap_monthly = paired.groupby(["year", "month"], as_index=False).sum(numeric_only=True)
+        return calibration_df, empty_ov, {
+            "overlap_pearson_r": 0.0,
+            "overlap_r2": 0.0,
+            "ols_slope": 1.0,
+            "ols_intercept": 0.0,
+            "overlap_alpha_day": 1.0,
+            "overlap_alpha_night": 1.0,
+            "overlap_alpha_overall": 1.0,
+            "has_valid_overlap": False,
+        }
+
+    # Global & Day/Night sum ratios: alpha(dn) = Sum(MODIS_cells) / Sum(VIIRS_cells)
+    global_alpha_cells = total_m_cells / total_v_cells
+    total_m_frp = float(paired["modis_frp_sum"].sum())
+    total_v_frp = float(paired["viirs_frp_sum"].sum())
+    global_alpha_frp = (
+        total_m_frp / total_v_frp if (total_m_frp > 0.0 and total_v_frp > 0.0) else global_alpha_cells
+    )
+    total_m_raw = float(paired["modis_raw_points"].sum())
+    total_v_raw = float(paired["viirs_raw_points"].sum())
+    global_raw_ratio = (
+        total_m_raw / total_v_raw if (total_m_raw > 0.0 and total_v_raw > 0.0) else global_alpha_cells
+    )
+
+    cal_rows: list[dict[str, object]] = []
+    dn_headline_alphas: dict[str, float] = {}
+
+    for dn in ("D", "N"):
+        sub_dn = paired[paired["daynight"] == dn]
+        sum_m_dn = float(sub_dn["modis_active_cells"].sum())
+        sum_v_dn = float(sub_dn["viirs_active_cells"].sum())
+        base_alpha_dn = (
+            sum_m_dn / sum_v_dn if (sum_m_dn > 0.0 and sum_v_dn > 0.0) else global_alpha_cells
+        )
+        dn_headline_alphas[dn] = base_alpha_dn
+
+        sum_m_frp_dn = float(sub_dn["modis_frp_sum"].sum())
+        sum_v_frp_dn = float(sub_dn["viirs_frp_sum"].sum())
+        base_frp_dn = (
+            sum_m_frp_dn / sum_v_frp_dn
+            if (sum_m_frp_dn > 0.0 and sum_v_frp_dn > 0.0)
+            else global_alpha_frp
+        )
+        sum_m_raw_dn = float(sub_dn["modis_raw_points"].sum())
+        sum_v_raw_dn = float(sub_dn["viirs_raw_points"].sum())
+        base_raw_dn = (
+            sum_m_raw_dn / sum_v_raw_dn
+            if (sum_m_raw_dn > 0.0 and sum_v_raw_dn > 0.0)
+            else global_raw_ratio
+        )
+
+        dn_month_rows: list[dict[str, Any]] = []
+        for month in range(1, 13):
+            slice_df = sub_dn[sub_dn["month"] == month]
+            paired_both = slice_df[
+                (slice_df["modis_active_cells"] > 0.0) & (slice_df["viirs_active_cells"] > 0.0)
+            ]
+            n_paired = int(len(paired_both))
+            m_sum = float(slice_df["modis_active_cells"].sum())
+            v_sum = float(slice_df["viirs_active_cells"].sum())
+            m_frp = float(slice_df["modis_frp_sum"].sum())
+            v_frp = float(slice_df["viirs_frp_sum"].sum())
+            m_raw = float(slice_df["modis_raw_points"].sum())
+            v_raw = float(slice_df["viirs_raw_points"].sum())
+
+            if n_paired < 3 or m_sum <= 0.0 or v_sum <= 0.0:
+                dn_month_rows.append(
+                    {
+                        "month": month,
+                        "daynight": dn,
+                        "alpha_tilde": base_alpha_dn,
+                        "ci_low": np.nan,
+                        "ci_high": np.nan,
+                        "frp_tilde": base_frp_dn,
+                        "raw_ratio": base_raw_dn,
+                        "v_sum": v_sum,
+                        "v_frp": v_frp,
+                        "overlap_samples": n_paired,
+                        "used_fallback": True,
+                        "calibration_status": "no_data",
+                    }
+                )
+            else:
+                month_ratio = m_sum / v_sum
+                # Empirical-Bayes shrinkage toward the day/night sum ratio
+                shrink_w = min(0.35, n_paired / (n_paired + 12.0))
+                alpha_tilde = shrink_w * month_ratio + (1.0 - shrink_w) * base_alpha_dn
+
+                ci_low, ci_high = _bootstrap_sum_ratio_ci(
+                    slice_df["modis_active_cells"].to_numpy(dtype=float),
+                    slice_df["viirs_active_cells"].to_numpy(dtype=float),
+                    base_alpha=base_alpha_dn,
+                    shrink_weight=shrink_w,
+                    n_bootstrap=n_bootstrap,
+                    seed=seed + month * 10 + (1 if dn == "N" else 0),
+                )
+                if np.isfinite(ci_low) and np.isfinite(ci_high):
+                    ci_low = min(ci_low, alpha_tilde)
+                    ci_high = max(ci_high, alpha_tilde)
+
+                # FRP ratio: use base_frp_dn when sparse (<5 paired months) and clamp extreme outliers
+                if n_paired < 5 or m_frp <= 0.0 or v_frp <= 0.0:
+                    frp_tilde = base_frp_dn
+                else:
+                    raw_frp_ratio = float(
+                        np.clip(m_frp / v_frp, 0.35 * base_frp_dn, 1.75 * base_frp_dn)
+                    )
+                    w_frp = min(0.25, n_paired / (n_paired + 15.0))
+                    frp_tilde = w_frp * raw_frp_ratio + (1.0 - w_frp) * base_frp_dn
+
+                raw_ratio = (m_raw / v_raw) if (m_raw > 0.0 and v_raw > 0.0) else base_raw_dn
+                dn_month_rows.append(
+                    {
+                        "month": month,
+                        "daynight": dn,
+                        "alpha_tilde": alpha_tilde,
+                        "ci_low": ci_low,
+                        "ci_high": ci_high,
+                        "frp_tilde": frp_tilde,
+                        "raw_ratio": raw_ratio,
+                        "v_sum": v_sum,
+                        "v_frp": v_frp,
+                        "overlap_samples": n_paired,
+                        "used_fallback": False,
+                        "calibration_status": "calibrated",
+                    }
+                )
+
+        # Normalize shrunk monthly weights so Sum(alpha_final * VIIRS_m) == Sum(MODIS) per day/night
+        pred_v_dn = sum(r["alpha_tilde"] * r["v_sum"] for r in dn_month_rows)
+        norm_cells = (sum_m_dn / pred_v_dn) if (pred_v_dn > 0.0 and sum_m_dn > 0.0) else 1.0
+
+        pred_frp_dn = sum(r["frp_tilde"] * r["v_frp"] for r in dn_month_rows)
+        norm_frp = (
+            sum_m_frp_dn / pred_frp_dn if (pred_frp_dn > 0.0 and sum_m_frp_dn > 0.0) else 1.0
+        )
+
+        for r in dn_month_rows:
+            a_val = float(r["alpha_tilde"] * norm_cells)
+            ci_l = float(r["ci_low"] * norm_cells) if np.isfinite(r["ci_low"]) else np.nan
+            ci_h = float(r["ci_high"] * norm_cells) if np.isfinite(r["ci_high"]) else np.nan
+            f_val = float(r["frp_tilde"] * norm_frp)
+            cal_rows.append(
+                {
+                    "month": int(r["month"]),
+                    "daynight": str(r["daynight"]),
+                    "alpha_cells": round(a_val, 5),
+                    "alpha_ci_low": round(ci_l, 5) if np.isfinite(ci_l) else np.nan,
+                    "alpha_ci_high": round(ci_h, 5) if np.isfinite(ci_h) else np.nan,
+                    "alpha_frp": round(f_val, 5),
+                    "raw_point_ratio": round(float(r["raw_ratio"]), 4),
+                    "overlap_samples": int(r["overlap_samples"]),
+                    "used_fallback": bool(r["used_fallback"]),
+                    "calibration_status": str(r["calibration_status"]),
+                }
+            )
+
+    calibration_df = (
+        pd.DataFrame(cal_rows).sort_values(["month", "daynight"]).reset_index(drop=True)
+    )
+
+    overlap_monthly = paired.groupby(["year", "month"], as_index=False).sum(numeric_only=True)
 
     valid_corr = overlap_monthly[
         (overlap_monthly["modis_active_cells"] > 0) & (overlap_monthly["viirs_active_cells"] > 0)
@@ -434,21 +531,38 @@ def compute_overlap_calibration(
     if len(valid_corr) >= 3:
         x = valid_corr["viirs_active_cells"].to_numpy(dtype=float)
         y = valid_corr["modis_active_cells"].to_numpy(dtype=float)
-        reg = stats.linregress(x, y)
-        y_pred = reg.slope * x + reg.intercept
-        corr_r2 = float(r2_score(y, y_pred))
+        if float(np.std(x)) > 1e-9 and float(np.std(y)) > 1e-9:
+            reg = stats.linregress(x, y)
+            y_pred = reg.slope * x + reg.intercept
+            corr_r2 = float(r2_score(y, y_pred))
+            rval = float(reg.rvalue)
+            slope_val = float(reg.slope)
+            intercept_val = float(reg.intercept)
+        else:
+            corr_r2 = 0.0
+            rval = 0.0
+            slope_val = float(global_alpha_cells)
+            intercept_val = 0.0
         corr_stats = {
-            "overlap_pearson_r": round(float(reg.rvalue), 4),
+            "overlap_pearson_r": round(rval, 4),
             "overlap_r2": round(corr_r2, 4),
-            "ols_slope": round(float(reg.slope), 4),
-            "ols_intercept": round(float(reg.intercept), 4),
+            "ols_slope": round(slope_val, 4),
+            "ols_intercept": round(intercept_val, 4),
+            "overlap_alpha_day": round(float(dn_headline_alphas.get("D", global_alpha_cells)), 4),
+            "overlap_alpha_night": round(float(dn_headline_alphas.get("N", global_alpha_cells)), 4),
+            "overlap_alpha_overall": round(float(global_alpha_cells), 4),
+            "has_valid_overlap": True,
         }
     else:
         corr_stats = {
             "overlap_pearson_r": 0.0,
             "overlap_r2": 0.0,
-            "ols_slope": global_alpha_cells,
+            "ols_slope": round(float(global_alpha_cells), 4),
             "ols_intercept": 0.0,
+            "overlap_alpha_day": round(float(dn_headline_alphas.get("D", global_alpha_cells)), 4),
+            "overlap_alpha_night": round(float(dn_headline_alphas.get("N", global_alpha_cells)), 4),
+            "overlap_alpha_overall": round(float(global_alpha_cells), 4),
+            "has_valid_overlap": bool(not bool(calibration_df["used_fallback"].all())),
         }
 
     return calibration_df, overlap_monthly, corr_stats
@@ -457,11 +571,14 @@ def compute_overlap_calibration(
 def build_in_window_calibration(
     gridded_df: pd.DataFrame,
     min_cells_threshold: int = 30,
+    n_bootstrap: int = 100,
+    seed: int = 42,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """Derive honest in-window MODIS-equivalent scaling factors without invented constants.
 
     Populates all 12 calendar months x ('D', 'N') so multi-month short windows
-    never leave uncovered months with silent uncalibrated values.
+    never leave uncovered months with silent uncalibrated values. Rows without sufficient
+    paired data receive NaN CI bounds and ``calibration_status='no_data'``.
     """
     cols = [
         "month",
@@ -473,6 +590,7 @@ def build_in_window_calibration(
         "raw_point_ratio",
         "overlap_samples",
         "used_fallback",
+        "calibration_status",
         "n_modis_cells",
         "n_viirs_cells",
     ]
@@ -485,6 +603,7 @@ def build_in_window_calibration(
         viirs_raw_pts = 0.0
         m_sub = pd.DataFrame()
         v_sub = pd.DataFrame()
+        work = pd.DataFrame()
     else:
         dn_norm = gridded_df["daynight"].astype(str).str.upper()
         work = gridded_df.assign(_dn_upper=dn_norm)
@@ -507,12 +626,21 @@ def build_in_window_calibration(
         raw_point_ratio = 1.0
         dn_alpha_cells = {"D": 1.0, "N": 1.0}
         dn_alpha_frp = {"D": 1.0, "N": 1.0}
+        dn_ci: dict[str, tuple[float, float]] = {
+            "D": (np.nan, np.nan),
+            "N": (np.nan, np.nan),
+        }
         used_fallback = True
         low_sample_warning = True
+        calibration_status = "no_data"
         mode_label = "VIIRS native (not harmonized to MODIS)"
     else:
         overall_alpha_cells = float(n_modis_cells / max(n_viirs_cells, 1))
-        overall_alpha_frp = float(modis_frp_sum / max(viirs_frp_sum, 1e-6))
+        overall_alpha_frp = (
+            float(modis_frp_sum / max(viirs_frp_sum, 1e-6))
+            if (modis_frp_sum > 0.0 and viirs_frp_sum > 0.0)
+            else overall_alpha_cells
+        )
         raw_point_ratio = (
             float(modis_raw_pts / max(viirs_raw_pts, 1.0))
             if modis_raw_pts > 0 and viirs_raw_pts > 0
@@ -520,13 +648,15 @@ def build_in_window_calibration(
         )
         dn_alpha_cells = {}
         dn_alpha_frp = {}
+        dn_ci = {}
         for dn in ("D", "N"):
             m_dn = m_sub[m_sub["_dn_upper"] == dn]
             v_dn = v_sub[v_sub["_dn_upper"] == dn]
             n_modis_dn = int(m_dn["active_cell_count"].sum())
             n_viirs_dn = int(v_dn["active_cell_count"].sum())
             if n_modis_dn >= 10 and n_viirs_dn >= 10:
-                dn_alpha_cells[dn] = float(n_modis_dn / n_viirs_dn)
+                a_dn = float(n_modis_dn / n_viirs_dn)
+                dn_alpha_cells[dn] = a_dn
                 m_dn_frp = float(m_dn["frp_sum"].sum())
                 v_dn_frp = float(v_dn["frp_sum"].sum())
                 dn_alpha_frp[dn] = (
@@ -534,12 +664,29 @@ def build_in_window_calibration(
                     if m_dn_frp > 0 and v_dn_frp > 0
                     else overall_alpha_frp
                 )
+                # Paired daily bootstrap CI when >=3 dates observed
+                m_day = m_dn.groupby("acq_date")["active_cell_count"].sum()
+                v_day = v_dn.groupby("acq_date")["active_cell_count"].sum()
+                day_pair = pd.concat([m_day.rename("m"), v_day.rename("v")], axis=1).fillna(0.0)
+                if len(day_pair) >= 3:
+                    dn_ci[dn] = _bootstrap_sum_ratio_ci(
+                        day_pair["m"].to_numpy(dtype=float),
+                        day_pair["v"].to_numpy(dtype=float),
+                        base_alpha=a_dn,
+                        shrink_weight=1.0,
+                        n_bootstrap=n_bootstrap,
+                        seed=seed + (1 if dn == "N" else 0),
+                    )
+                else:
+                    dn_ci[dn] = (np.nan, np.nan)
             else:
                 dn_alpha_cells[dn] = overall_alpha_cells
                 dn_alpha_frp[dn] = overall_alpha_frp
+                dn_ci[dn] = (np.nan, np.nan)
 
         used_fallback = False
         low_sample_warning = False
+        calibration_status = "calibrated"
         mode_label = (
             f"In-window MODIS-equivalent (from {n_modis_cells} MODIS / {n_viirs_cells} VIIRS cells)"
         )
@@ -548,19 +695,21 @@ def build_in_window_calibration(
     rows: list[dict[str, Any]] = []
     for month in range(1, 13):
         for dn in ("D", "N"):
-            a_cells = round(float(dn_alpha_cells[dn]), 4)
-            a_frp = round(float(dn_alpha_frp[dn]), 4)
+            a_cells = round(float(dn_alpha_cells[dn]), 5)
+            a_frp = round(float(dn_alpha_frp[dn]), 5)
+            ci_l, ci_h = dn_ci[dn]
             rows.append(
                 {
                     "month": month,
                     "daynight": dn,
                     "alpha_cells": a_cells,
-                    "alpha_ci_low": a_cells,
-                    "alpha_ci_high": a_cells,
+                    "alpha_ci_low": round(float(ci_l), 5) if np.isfinite(ci_l) else np.nan,
+                    "alpha_ci_high": round(float(ci_h), 5) if np.isfinite(ci_h) else np.nan,
                     "alpha_frp": a_frp,
                     "raw_point_ratio": round(float(raw_point_ratio), 4),
                     "overlap_samples": overlap_samples,
                     "used_fallback": used_fallback,
+                    "calibration_status": calibration_status,
                     "n_modis_cells": n_modis_cells,
                     "n_viirs_cells": n_viirs_cells,
                 }
@@ -698,6 +847,8 @@ def build_harmonized_series(
                 "viirs_calibrated_frp",
                 "harmonized_frp",
                 "primary_source",
+                "data_status",
+                "sensor_coverage",
             ]
         )
         return empty_monthly, gridded_df.copy()
@@ -731,22 +882,14 @@ def build_harmonized_series(
     )
 
     min_year, max_year = int(cells["year"].min()), int(cells["year"].max())
+    min_obs_ym = str(cells["acq_date"].min())[:7]
+    max_obs_ym = str(cells["acq_date"].max())[:7]
+    observed_years = set(cells["year"].astype(int).unique())
+
     full_grid = pd.MultiIndex.from_product(
         [range(min_year, max_year + 1), range(1, 13)],
         names=["year", "month"],
     ).to_frame(index=False)
-    today_dt = date.today()
-    if max_year >= today_dt.year:
-        max_obs_month = int(cells.loc[cells["year"] == max_year, "month"].max())
-        cutoff_month = (
-            max(today_dt.month, max_obs_month)
-            if max_year == today_dt.year
-            else max_obs_month
-        )
-        full_grid = full_grid[
-            (full_grid["year"] < max_year)
-            | ((full_grid["year"] == max_year) & (full_grid["month"] <= cutoff_month))
-        ].reset_index(drop=True)
 
     monthly = (
         full_grid.merge(m_sub, on=["year", "month"], how="left")
@@ -755,6 +898,13 @@ def build_harmonized_series(
     )
 
     monthly["date_label"] = [f"{int(y):04d}-{int(m):02d}" for y, m in zip(monthly["year"], monthly["month"])]
+    is_observed = (
+        (monthly["date_label"] >= min_obs_ym)
+        & (monthly["date_label"] <= max_obs_ym)
+        & monthly["year"].isin(observed_years)
+    )
+    monthly["data_status"] = np.where(is_observed, "observed", "no_data")
+
     monthly["raw_total_points"] = monthly["modis_raw_points"] + monthly["viirs_raw_points"]
     monthly["gridded_total_cells"] = monthly["modis_active_cells"] + monthly["viirs_active_cells"]
     monthly["raw_total_frp"] = monthly["modis_frp_sum"] + monthly["viirs_frp_sum"]
@@ -775,26 +925,49 @@ def build_harmonized_series(
     )
 
     if combination_mode == "ensemble":
-        monthly["harmonized_hotspots"] = np.round(monthly["ensemble_hotspots"], 2)
-        monthly["harmonized_frp"] = np.round(ensemble_frp, 2)
+        harm_cells_vals = np.round(monthly["ensemble_hotspots"], 2)
+        harm_frp_vals = np.round(ensemble_frp, 2)
     else:
         use_viirs = is_post_transition & has_viirs
-        monthly["harmonized_hotspots"] = np.round(
+        harm_cells_vals = np.round(
             np.where(use_viirs, monthly["viirs_calibrated_cells"], monthly["modis_active_cells"]),
             2,
         )
-        monthly["harmonized_frp"] = np.round(
+        harm_frp_vals = np.round(
             np.where(use_viirs, monthly["viirs_calibrated_frp"], monthly["modis_frp_sum"]),
             2,
         )
 
-    monthly["primary_source"] = np.where(
-        ~is_post_transition | (~has_viirs),
-        "MODIS",
+    monthly["harmonized_hotspots"] = np.where(is_observed, harm_cells_vals, np.nan)
+    monthly["harmonized_frp"] = np.where(is_observed, harm_frp_vals, np.nan)
+    monthly["ensemble_hotspots"] = np.where(is_observed, np.round(monthly["ensemble_hotspots"], 2), np.nan)
+
+    is_terra_only = monthly["date_label"] < "2002-07"
+    monthly["sensor_coverage"] = np.where(
+        ~is_observed,
+        "no_data",
         np.where(
-            (combination_mode == "ensemble") & has_modis,
-            "MODIS+VIIRS Ensemble",
-            "VIIRS Calibrated",
+            ~is_post_transition,
+            np.where(is_terra_only, "MODIS_only (Terra only)", "MODIS_only (Terra+Aqua)"),
+            np.where(
+                has_viirs,
+                "MODIS+VIIRS_SNPP",
+                np.where(has_modis, "MODIS_only (VIIRS missing)", "Observed (0 detections)"),
+            ),
+        ),
+    )
+
+    monthly["primary_source"] = np.where(
+        ~is_observed,
+        "No Data",
+        np.where(
+            ~is_post_transition | (~has_viirs),
+            "MODIS",
+            np.where(
+                (combination_mode == "ensemble") & has_modis,
+                "MODIS+VIIRS Ensemble",
+                "VIIRS Calibrated",
+            ),
         ),
     )
 
@@ -838,8 +1011,13 @@ def _compute_holdout_and_anomaly_metrics(
     deseasonalized_r = 0.0
 
     if not monthly_df.empty:
+        obs_mask = (
+            monthly_df["data_status"] == "observed"
+            if "data_status" in monthly_df.columns
+            else pd.Series(True, index=monthly_df.index)
+        )
         ov_m = monthly_df[
-            (monthly_df["date_label"] >= "2012-03") & (monthly_df["year"] <= 2025)
+            obs_mask & (monthly_df["date_label"] >= "2012-03") & (monthly_df["year"] <= 2025)
         ].copy()
         ov_active = ov_m[
             (ov_m["modis_active_cells"] > 0) | (ov_m["viirs_calibrated_cells"] > 0)
@@ -864,7 +1042,7 @@ def _compute_holdout_and_anomaly_metrics(
         cal_train, _, _ = compute_overlap_calibration(
             gridded_df,
             overlap_years=(2012, 2018),
-            n_bootstrap=20,
+            n_bootstrap=40,
         )
         if not bool(cal_train["used_fallback"].all()):
             holdout = gridded_df[
@@ -884,25 +1062,35 @@ def _compute_holdout_and_anomaly_metrics(
             if m_hold_sum > 0 and v_hold_cal_sum > 0:
                 holdout_bias_pct = ((v_hold_cal_sum - m_hold_sum) / m_hold_sum) * 100.0
     elif not monthly_df.empty:
+        obs_mask = (
+            monthly_df["data_status"] == "observed"
+            if "data_status" in monthly_df.columns
+            else pd.Series(True, index=monthly_df.index)
+        )
         train_m = monthly_df[
-            (monthly_df["date_label"] >= "2012-03")
+            obs_mask
+            & (monthly_df["date_label"] >= "2012-03")
             & (monthly_df["year"] <= 2018)
             & (monthly_df["modis_active_cells"] > 0)
             & (monthly_df["viirs_active_cells"] > 0)
         ]
         test_m = monthly_df[
-            (monthly_df["year"] >= 2019) & (monthly_df["year"] <= 2025)
+            obs_mask & (monthly_df["year"] >= 2019) & (monthly_df["year"] <= 2025)
         ]
         if not train_m.empty and not test_m.empty:
             global_a = float(
-                np.median(train_m["modis_active_cells"])
-                / max(np.median(train_m["viirs_active_cells"]), 1e-6)
+                train_m["modis_active_cells"].sum()
+                / max(float(train_m["viirs_active_cells"].sum()), 1e-6)
             )
             month_alphas: dict[int, float] = {}
             for m_num, grp in train_m.groupby("month"):
-                med_v = float(np.median(grp["viirs_active_cells"]))
-                med_m = float(np.median(grp["modis_active_cells"]))
-                month_alphas[int(m_num)] = med_m / max(med_v, 1e-6) if med_v > 0 and med_m > 0 else global_a
+                sum_v = float(grp["viirs_active_cells"].sum())
+                sum_m = float(grp["modis_active_cells"].sum())
+                month_alphas[int(m_num)] = (
+                    (0.35 * (sum_m / sum_v) + 0.65 * global_a)
+                    if (sum_v > 0 and sum_m > 0 and len(grp) >= 3)
+                    else global_a
+                )
             alphas_series = test_m["month"].map(lambda m: month_alphas.get(int(m), global_a))
             v_hold_cal = float((test_m["viirs_active_cells"] * alphas_series).sum())
             m_hold = float(test_m["modis_active_cells"].sum())
@@ -921,32 +1109,57 @@ def evaluate_2012_transition(
     corr_stats: dict[str, float],
     reference_metrics: Optional[dict[str, float]] = None,
     gridded_df: Optional[pd.DataFrame] = None,
-) -> dict[str, float]:
-    """Quantify how much of the artificial 2012 sensor step jump was removed.
+    pre2012_start_year: int = 2003,
+) -> dict[str, Any]:
+    """Evaluate harmonization accuracy, overlap residual bias, holdout, and natural variability.
 
-    Excludes the incomplete current calendar year from post-2012 annual means and
-    computes Out-of-Sample holdout validation (2012–2018 train -> 2019–2025 test)
-    plus deseasonalized monthly anomaly correlation.
+    Uses ``pre2012_start_year`` (default 2003, excluding 2001–2002 Terra-only years)
+    when comparing pre-2012 and post-2012 baselines, and benchmarks harmonized differences
+    against the MODIS-only natural variability signal.
     """
-    annual = monthly_df.groupby("year", as_index=False).sum(numeric_only=True)
+    obs_monthly = (
+        monthly_df[monthly_df["data_status"] == "observed"].copy()
+        if (not monthly_df.empty and "data_status" in monthly_df.columns)
+        else monthly_df.copy()
+    )
+    annual = obs_monthly.groupby("year", as_index=False).sum(numeric_only=True) if not obs_monthly.empty else obs_monthly
     current_year = date.today().year
     annual_complete = annual[annual["year"] < current_year] if not annual.empty else annual
-    pre = annual_complete[annual_complete["year"] <= 2011]
-    post = annual_complete[annual_complete["year"] >= 2013]
+
+    pre = (
+        annual_complete[
+            (annual_complete["year"] >= int(pre2012_start_year)) & (annual_complete["year"] <= 2011)
+        ]
+        if not annual_complete.empty
+        else annual_complete
+    )
+    if pre.empty and not annual_complete.empty:
+        pre = annual_complete[annual_complete["year"] <= 2011]
+
+    post = annual_complete[annual_complete["year"] >= 2013] if not annual_complete.empty else annual_complete
     if post.empty and not annual.empty:
         post = annual[annual["year"] >= 2013]
 
-    day_alpha = float(calibration_df.loc[calibration_df["daynight"] == "D", "alpha_cells"].mean())
-    night_alpha = float(calibration_df.loc[calibration_df["daynight"] == "N", "alpha_cells"].mean())
-    overall_alpha = float(calibration_df["alpha_cells"].mean())
+    cal_all_fallback = (
+        bool(calibration_df["used_fallback"].all()) if not calibration_df.empty else True
+    )
+    cal_valid_ci = calibration_df[
+        calibration_df["alpha_ci_low"].notna() & calibration_df["alpha_ci_high"].notna()
+    ]
+    alpha_ci_width_mean = (
+        round(float((cal_valid_ci["alpha_ci_high"] - cal_valid_ci["alpha_ci_low"]).mean()), 4)
+        if not cal_valid_ci.empty
+        else np.nan
+    )
 
-    live_raw_points = float(monthly_df["raw_total_points"].sum()) if not monthly_df.empty else 0.0
-    live_gridded_cells = float(monthly_df["gridded_total_cells"].sum()) if not monthly_df.empty else 0.0
-    live_harmonized = float(monthly_df["harmonized_hotspots"].sum()) if not monthly_df.empty else 0.0
+    live_raw_points = float(obs_monthly["raw_total_points"].sum()) if not obs_monthly.empty else 0.0
+    live_gridded_cells = float(obs_monthly["gridded_total_cells"].sum()) if not obs_monthly.empty else 0.0
+    live_harmonized = float(obs_monthly["harmonized_hotspots"].sum()) if not obs_monthly.empty else 0.0
 
-    is_short_window = pre.empty or post.empty or (monthly_df["year"].nunique() < 2)
+    is_short_window = pre.empty or post.empty or (obs_monthly["year"].nunique() < 2)
     if is_short_window and reference_metrics:
         return {
+            "pre2012_start_year": int(reference_metrics.get("pre2012_start_year", pre2012_start_year)),
             "pre2012_raw_annual_mean": float(reference_metrics.get("pre2012_raw_annual_mean", 0.0)),
             "post2012_raw_combined_annual_mean": float(
                 reference_metrics.get("post2012_raw_combined_annual_mean", 0.0)
@@ -969,6 +1182,9 @@ def evaluate_2012_transition(
                 reference_metrics.get("post2012_harmonized_annual_mean", 0.0)
             ),
             "harmonized_diff_pct": float(reference_metrics.get("harmonized_diff_pct", 0.0)),
+            "pre2012_modis_annual_mean": float(reference_metrics.get("pre2012_modis_annual_mean", 0.0)),
+            "post2012_modis_annual_mean": float(reference_metrics.get("post2012_modis_annual_mean", 0.0)),
+            "modis_natural_change_pct": float(reference_metrics.get("modis_natural_change_pct", 0.0)),
             "overlap_sensor_residual_bias_pct": float(
                 reference_metrics.get("overlap_sensor_residual_bias_pct", 0.0)
             ),
@@ -976,13 +1192,14 @@ def evaluate_2012_transition(
             "deseasonalized_anomaly_r": float(
                 reference_metrics.get("deseasonalized_anomaly_r", 0.0)
             ),
+            "alpha_ci_width_mean": reference_metrics.get("alpha_ci_width_mean", alpha_ci_width_mean),
             "jump_reduction_pct": float(reference_metrics.get("jump_reduction_pct", 0.0)),
-            "mean_alpha_day": round(day_alpha, 4),
-            "mean_alpha_night": round(night_alpha, 4),
-            "mean_alpha_overall": round(overall_alpha, 4),
+            "mean_alpha_day": float(reference_metrics.get("mean_alpha_day", 1.0)),
+            "mean_alpha_night": float(reference_metrics.get("mean_alpha_night", 1.0)),
+            "mean_alpha_overall": float(reference_metrics.get("mean_alpha_overall", 1.0)),
             "overlap_pearson_r": float(reference_metrics.get("overlap_pearson_r", 0.0)),
             "overlap_r2": float(reference_metrics.get("overlap_r2", 0.0)),
-            "ols_slope": float(reference_metrics.get("ols_slope", overall_alpha)),
+            "ols_slope": float(reference_metrics.get("ols_slope", 1.0)),
             "ols_intercept": float(reference_metrics.get("ols_intercept", 0.0)),
             "used_reference_calibration": True,
             "has_valid_overlap": True,
@@ -999,6 +1216,10 @@ def evaluate_2012_transition(
     pre_harm_mean = float(pre["harmonized_hotspots"].mean()) if not pre.empty else 0.0
     post_harm_mean = float(post["harmonized_hotspots"].mean()) if not post.empty else 0.0
 
+    # MODIS-only benchmark over the same pre/post periods to separate natural fire shift
+    pre_modis_mean = float(pre["modis_active_cells"].mean()) if not pre.empty else 0.0
+    post_modis_mean = float(post["modis_active_cells"].mean()) if not post.empty else 0.0
+
     def _pct_jump(after_val: float, before_val: float) -> float:
         if before_val <= 0:
             return 0.0
@@ -1008,21 +1229,56 @@ def evaluate_2012_transition(
     raw_viirs_jump_pct = _pct_jump(post_raw_viirs_mean, pre_raw_mean)
     gridded_uncal_jump_pct = _pct_jump(post_gridded_viirs_mean, pre_harm_mean)
     harmonized_diff_pct = _pct_jump(post_harm_mean, pre_harm_mean)
+    modis_natural_change_pct = _pct_jump(post_modis_mean, pre_modis_mean)
 
-    # Sensor-only residual bias during overlap years (2012–2025): calibrated VIIRS vs MODIS
-    ov = annual_complete[(annual_complete["year"] >= 2012) & (annual_complete["year"] <= 2025)]
-    if ov.empty and not annual.empty:
-        ov = annual[(annual["year"] >= 2012) & (annual["year"] <= 2025)]
-    ov_modis = float(ov["modis_active_cells"].sum()) if not ov.empty else 0.0
-    ov_viirs_cal = float(ov["viirs_calibrated_cells"].sum()) if not ov.empty else 0.0
+    # Concurrent overlap (2012-03 .. 2025-12) sensor residual bias: calibrated VIIRS vs MODIS
+    ov_m = obs_monthly[
+        (obs_monthly["date_label"] >= "2012-03")
+        & (obs_monthly["year"] <= OVERLAP_YEARS[1])
+        & (obs_monthly["year"] < current_year)
+    ]
+    if ov_m.empty and not obs_monthly.empty:
+        ov_m = obs_monthly[
+            (obs_monthly["date_label"] >= "2012-03")
+            & (obs_monthly["year"] <= OVERLAP_YEARS[1])
+        ]
+    ov_modis = float(ov_m["modis_active_cells"].sum()) if not ov_m.empty else 0.0
+    ov_viirs_cal = float(ov_m["viirs_calibrated_cells"].sum()) if not ov_m.empty else 0.0
     has_valid_overlap = bool(
-        ov_modis > 0
-        and ov_viirs_cal > 0
-        and not bool(calibration_df["used_fallback"].all())
+        ov_modis > 0 and ov_viirs_cal > 0 and not cal_all_fallback
     )
     overlap_sensor_residual_bias_pct = (
         _pct_jump(ov_viirs_cal, ov_modis) if has_valid_overlap else 0.0
     )
+
+    # Headline alpha_day / alpha_night / alpha_overall as exact overlap sum ratios
+    if not has_valid_overlap:
+        day_alpha = 1.0
+        night_alpha = 1.0
+        overall_alpha = 1.0
+    elif gridded_df is not None and not gridded_df.empty:
+        ov_g = gridded_df[
+            (gridded_df["acq_date"] >= VIIRS_TRANSITION_DATE)
+            & (gridded_df["year"] >= OVERLAP_YEARS[0])
+            & (gridded_df["year"] <= OVERLAP_YEARS[1])
+        ]
+        m_tot = float(ov_g.loc[ov_g["sensor_group"] == "MODIS", "active_cell_count"].sum())
+        v_tot = float(ov_g.loc[ov_g["sensor_group"] == "VIIRS", "active_cell_count"].sum())
+        overall_alpha = (m_tot / v_tot) if (m_tot > 0 and v_tot > 0) else 1.0
+        m_d = float(ov_g.loc[(ov_g["sensor_group"] == "MODIS") & (ov_g["daynight"] == "D"), "active_cell_count"].sum())
+        v_d = float(ov_g.loc[(ov_g["sensor_group"] == "VIIRS") & (ov_g["daynight"] == "D"), "active_cell_count"].sum())
+        day_alpha = (m_d / v_d) if (m_d > 0 and v_d > 0) else overall_alpha
+        m_n = float(ov_g.loc[(ov_g["sensor_group"] == "MODIS") & (ov_g["daynight"] == "N"), "active_cell_count"].sum())
+        v_n = float(ov_g.loc[(ov_g["sensor_group"] == "VIIRS") & (ov_g["daynight"] == "N"), "active_cell_count"].sum())
+        night_alpha = (m_n / v_n) if (m_n > 0 and v_n > 0) else overall_alpha
+    elif "overlap_alpha_overall" in corr_stats:
+        day_alpha = float(corr_stats.get("overlap_alpha_day", 1.0))
+        night_alpha = float(corr_stats.get("overlap_alpha_night", 1.0))
+        overall_alpha = float(corr_stats.get("overlap_alpha_overall", 1.0))
+    else:
+        day_alpha = float(calibration_df.loc[calibration_df["daynight"] == "D", "alpha_cells"].mean())
+        night_alpha = float(calibration_df.loc[calibration_df["daynight"] == "N", "alpha_cells"].mean())
+        overall_alpha = float(calibration_df["alpha_cells"].mean())
 
     jump_reduction_pct = 0.0
     if has_valid_overlap and abs(raw_combined_jump_pct) > 1e-6:
@@ -1031,12 +1287,19 @@ def evaluate_2012_transition(
         )
 
     oos_metrics = (
-        _compute_holdout_and_anomaly_metrics(monthly_df=monthly_df, gridded_df=gridded_df)
+        _compute_holdout_and_anomaly_metrics(monthly_df=obs_monthly, gridded_df=gridded_df)
         if has_valid_overlap
         else {"holdout_bias_pct": 0.0, "deseasonalized_anomaly_r": 0.0}
     )
 
+    clean_corr = {
+        k: v
+        for k, v in corr_stats.items()
+        if k in ("overlap_pearson_r", "overlap_r2", "ols_slope", "ols_intercept")
+    }
+
     return {
+        "pre2012_start_year": int(pre2012_start_year),
         "pre2012_raw_annual_mean": round(pre_raw_mean, 1),
         "post2012_raw_combined_annual_mean": round(post_raw_combined_mean, 1),
         "raw_combined_jump_pct": round(raw_combined_jump_pct, 2),
@@ -1047,9 +1310,13 @@ def evaluate_2012_transition(
         "gridded_uncalibrated_jump_pct": round(gridded_uncal_jump_pct, 2),
         "post2012_harmonized_annual_mean": round(post_harm_mean, 1),
         "harmonized_diff_pct": round(harmonized_diff_pct, 2),
+        "pre2012_modis_annual_mean": round(pre_modis_mean, 1),
+        "post2012_modis_annual_mean": round(post_modis_mean, 1),
+        "modis_natural_change_pct": round(modis_natural_change_pct, 2),
         "overlap_sensor_residual_bias_pct": round(overlap_sensor_residual_bias_pct, 2),
         "holdout_bias_pct": oos_metrics["holdout_bias_pct"],
         "deseasonalized_anomaly_r": oos_metrics["deseasonalized_anomaly_r"],
+        "alpha_ci_width_mean": alpha_ci_width_mean,
         "jump_reduction_pct": round(jump_reduction_pct, 2),
         "mean_alpha_day": round(day_alpha, 4),
         "mean_alpha_night": round(night_alpha, 4),
@@ -1059,7 +1326,7 @@ def evaluate_2012_transition(
         "live_raw_points": round(live_raw_points, 1),
         "live_gridded_cells": round(live_gridded_cells, 1),
         "live_harmonized_hotspots": round(live_harmonized, 1),
-        **corr_stats,
+        **clean_corr,
     }
 
 
@@ -1074,6 +1341,7 @@ class HarmonizationPipeline:
         overlap_years: tuple[int, int] = OVERLAP_YEARS,
         combination_mode: str = "calibrated_viirs",
         daynight_filter: str = "All",
+        pre2012_start_year: int = 2003,
     ) -> None:
         self.modis_min_conf = modis_min_conf
         self.viirs_allowed_conf = list(
@@ -1083,6 +1351,7 @@ class HarmonizationPipeline:
         self.overlap_years = overlap_years
         self.combination_mode = combination_mode
         self.daynight_filter = daynight_filter
+        self.pre2012_start_year = int(pre2012_start_year)
 
     def run(
         self,
@@ -1125,6 +1394,7 @@ class HarmonizationPipeline:
             corr_stats=corr_stats,
             reference_metrics=reference_transition_metrics,
             gridded_df=gridded,
+            pre2012_start_year=self.pre2012_start_year,
         )
         return HarmonizationResult(
             filtered_points_df=normalized,

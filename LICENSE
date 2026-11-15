@@ -1,0 +1,47 @@
+MIT License
+
+Copyright (c) 2026 Egor / NASA Space Apps Challenge 2026 Team — Fire Harmonizer
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+-------------------------------------------------------------------------------
+DATA ATTRIBUTION & CITATION POLICY
+-------------------------------------------------------------------------------
+
+This software does NOT claim ownership of satellite active-fire observations.
+All satellite fire detections and thermal anomaly layers processed or displayed
+by this tool originate from official public datasets:
+
+1. NASA FIRMS / LANCE (Fire Information for Resource Management System)
+   - MODIS Collection 6.1 Active Fire & Thermal Anomalies (MCD14DL / MCD14ML)
+     https://doi.org/10.5067/FIRMS/MODIS/MCD14DL.NRT.0061
+   - VIIRS Suomi NPP 375 m Active Fire Product (VNP14IMGTDL / VNP14IMG)
+     https://doi.org/10.5067/FIRMS/VIIRS/VNP14IMGT_NRT.002
+   - VIIRS NOAA-20 375 m Active Fire Product (VJ114IMGTDL_NRT)
+     https://doi.org/10.5067/FIRMS/VIIRS/VJ114IMGT_NRT.002
+   - Official NASA FIRMS Citation Guidelines:
+     https://www.earthdata.nasa.gov/data/tools/firms/faq
+     Recommended acknowledgement:
+     "We acknowledge the use of data and/or imagery from NASA's Fire Information
+     for Resource Management System (FIRMS) (https://earthdata.nasa.gov/firms),
+     part of NASA's Earth Science Data and Information System (ESDIS)."
+
+2. CONAE (Comisión Nacional de Actividades Espaciales, Argentina)
+   - Focos de Calor / OGC WMS & WFS Geoservices for Córdoba Province & Argentina:
+     https://catalogos.conae.gov.ar/catalogo/catalogoGeoServiciosOGC.html
