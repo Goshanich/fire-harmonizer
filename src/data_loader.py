@@ -13,6 +13,7 @@ from __future__ import annotations
 import calendar
 import os
 import time
+import zipfile
 from datetime import date, timedelta
 from io import StringIO
 from pathlib import Path
@@ -31,6 +32,7 @@ from src.config import (
     GRID_STEP_DEG,
     MODIS_COLUMNS,
     RAW_DIR,
+    REAL_DIR,
     REGION_PRESETS,
     SAMPLE_DIR,
     VIIRS_COLUMNS,
@@ -38,6 +40,15 @@ from src.config import (
 )
 
 load_dotenv(BASE_DIR / ".env")
+
+REAL_MODIS_ARCHIVE_URL: str = (
+    "https://firms.modaps.eosdis.nasa.gov/data/download/DL_FIRE_M-C61_850925.zip"
+)
+REAL_VIIRS_ARCHIVE_URL: str = (
+    "https://firms.modaps.eosdis.nasa.gov/data/download/DL_FIRE_SV-C2_850926.zip"
+)
+REAL_MODIS_ZIP_NAME: str = "DL_FIRE_M-C61_850925.zip"
+REAL_VIIRS_ZIP_NAME: str = "DL_FIRE_SV-C2_850926.zip"
 
 
 class FIRMSApiError(RuntimeError):
@@ -748,6 +759,79 @@ def generate_all_sample_datasets(force: bool = False) -> dict[str, dict[str, obj
             "viirs_file": str(SAMPLE_DIR / f"viirs_{region_key}_2012_2026.csv"),
         }
     return summary
+
+
+def _extract_real_archive_csv(zip_name: str, download_url: str) -> Path:
+    """Ensure a NASA FIRMS ZIP archive is in RAW_DIR, extract its CSV, and return the CSV path."""
+    RAW_DIR.mkdir(parents=True, exist_ok=True)
+    zip_path = RAW_DIR / zip_name
+    if not zip_path.exists():
+        resp = requests.get(download_url, stream=True, timeout=60)
+        resp.raise_for_status()
+        with zip_path.open("wb") as fh:
+            for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    fh.write(chunk)
+
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        csv_members = [name for name in zf.namelist() if name.lower().endswith(".csv")]
+        if not csv_members:
+            raise ValueError(f"No CSV file found inside {zip_path}")
+        csv_member = csv_members[0]
+        extracted_path = RAW_DIR / Path(csv_member).name
+        if not extracted_path.exists():
+            with zf.open(csv_member) as src_f, extracted_path.open("wb") as dst_f:
+                dst_f.write(src_f.read())
+    return extracted_path
+
+
+def prepare_real_cordoba_dataset(force: bool = False) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Build or load the compact Córdoba 2001–2025 real NASA FIRMS CSV dataset in data/real/."""
+    REAL_DIR.mkdir(parents=True, exist_ok=True)
+    modis_out = REAL_DIR / "modis_cordoba_real_2001_2025.csv"
+    viirs_out = REAL_DIR / "viirs_cordoba_real_2012_2025.csv"
+
+    if not force and modis_out.exists() and viirs_out.exists():
+        return (
+            pd.read_csv(modis_out, dtype={"acq_time": str}),
+            pd.read_csv(viirs_out, dtype={"acq_time": str}, low_memory=False),
+        )
+
+    modis_raw_csv = _extract_real_archive_csv(REAL_MODIS_ZIP_NAME, REAL_MODIS_ARCHIVE_URL)
+    viirs_raw_csv = _extract_real_archive_csv(REAL_VIIRS_ZIP_NAME, REAL_VIIRS_ARCHIVE_URL)
+
+    west, south, east, north = REGION_PRESETS["cordoba_argentina"]["bbox"]
+
+    def _filter_bbox_csv(csv_path: Path) -> pd.DataFrame:
+        df = pd.read_csv(csv_path, low_memory=False)
+        mask = (
+            (df["longitude"] >= west)
+            & (df["longitude"] <= east)
+            & (df["latitude"] >= south)
+            & (df["latitude"] <= north)
+        )
+        sub = df.loc[mask].copy()
+        if "acq_time" in sub.columns:
+            sub["acq_time"] = (
+                sub["acq_time"]
+                .fillna("1200")
+                .astype(str)
+                .str.replace(r"\.0$", "", regex=True)
+                .str.strip()
+                .str.zfill(4)
+            )
+        return sub.sort_values(["acq_date", "acq_time"]).reset_index(drop=True)
+
+    modis_real = _filter_bbox_csv(modis_raw_csv)
+    viirs_real = _filter_bbox_csv(viirs_raw_csv)
+    modis_real.to_csv(modis_out, index=False)
+    viirs_real.to_csv(viirs_out, index=False)
+    return modis_real, viirs_real
+
+
+def load_real_cordoba_dataset() -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Load the pre-filtered real 2001–2025 NASA FIRMS MODIS & VIIRS archives for Córdoba."""
+    return prepare_real_cordoba_dataset(force=False)
 
 
 if __name__ == "__main__":

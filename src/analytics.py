@@ -8,8 +8,8 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-from src.config import PROCESSED_DIR, REGION_PRESETS
-from src.data_loader import generate_regional_sample_data
+from src.config import PROCESSED_DIR, REAL_DIR, REGION_PRESETS
+from src.data_loader import generate_regional_sample_data, load_real_cordoba_dataset
 from src.harmonizer import HarmonizationPipeline
 
 MONTH_LABELS: list[str] = [calendar.month_abbr[m] for m in range(1, 13)]
@@ -291,3 +291,41 @@ if __name__ == "__main__":
             f"Focus {kpis['focus_year']}-{kpis['focus_month_name']}={kpis['focus_status']} ({kpis['focus_anomaly_pct']:+.1f}%)"
         )
         print(f"  Exported: {exported['monthly_csv']}")
+
+    real_modis_path = REAL_DIR / "modis_cordoba_real_2001_2025.csv"
+    real_viirs_path = REAL_DIR / "viirs_cordoba_real_2012_2025.csv"
+    if real_modis_path.exists() and real_viirs_path.exists():
+        real_modis, real_viirs = load_real_cordoba_dataset()
+        real_res = pipeline.run(real_modis, real_viirs)
+        real_cal = build_calendar_matrix(real_res.monthly_df, value_col="harmonized_hotspots")
+        real_clim = compute_monthly_climatology(real_res.monthly_df)
+        real_anom = compute_monthly_anomalies(real_res.monthly_df, real_clim)
+        real_kpis = compute_kpi_metrics(
+            real_res.monthly_df,
+            real_anom,
+            real_res.transition_metrics,
+            real_clim,
+        )
+        real_exported = export_processed_outputs(
+            "cordoba_real",
+            real_res.monthly_df,
+            real_res.calibration_df,
+            real_cal,
+        )
+        rtm = real_res.transition_metrics
+        print("\n--- Real NASA FIRMS Archive: Córdoba Province (2001–2025) ---")
+        print(
+            f"  Rows: MODIS={len(real_modis):,}, VIIRS={len(real_viirs):,} | "
+            f"Alpha Overall={rtm['mean_alpha_overall']:.4f} "
+            f"(D={rtm['mean_alpha_day']:.4f}, N={rtm['mean_alpha_night']:.4f})"
+        )
+        print(
+            f"  Jump Suppression={rtm['jump_reduction_pct']:.2f}% | "
+            f"Overlap Bias={rtm['overlap_sensor_residual_bias_pct']:+.2f}% | "
+            f"Holdout Bias={rtm['holdout_bias_pct']:+.2f}% | "
+            f"R^2={rtm['overlap_r2']:.4f} | Deseasonalized r={rtm['deseasonalized_anomaly_r']:.4f}"
+        )
+        print(
+            f"  KPIs: Peak={real_kpis['peak_month_name']} | "
+            f"Worst Year={real_kpis['worst_year']} | Exported: {real_exported['calibration_csv']}"
+        )

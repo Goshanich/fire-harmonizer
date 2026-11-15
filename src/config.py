@@ -15,6 +15,7 @@ from typing import Any
 BASE_DIR: Path = Path(__file__).resolve().parent.parent
 DATA_DIR: Path = BASE_DIR / "data"
 RAW_DIR: Path = DATA_DIR / "raw"
+REAL_DIR: Path = DATA_DIR / "real"
 SAMPLE_DIR: Path = DATA_DIR / "sample"
 PROCESSED_DIR: Path = DATA_DIR / "processed"
 PIP_CACHE_DIR: Path = (
@@ -24,7 +25,7 @@ PIP_CACHE_DIR: Path = (
 
 def ensure_project_dirs() -> None:
     """Create required project data directories inside BASE_DIR."""
-    for directory in (DATA_DIR, RAW_DIR, SAMPLE_DIR, PROCESSED_DIR):
+    for directory in (DATA_DIR, RAW_DIR, REAL_DIR, SAMPLE_DIR, PROCESSED_DIR):
         directory.mkdir(parents=True, exist_ok=True)
 
 

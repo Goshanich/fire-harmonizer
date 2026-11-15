@@ -12,10 +12,12 @@ __pycache__/
 *.py[cod]
 *$py.class
 
-# Ignore raw downloads & generated outputs, keep sample/ and calibration tables for offline/cloud demo
+# Ignore raw downloads & generated outputs, keep real/, sample/ and calibration tables
 data/raw/
 data/processed/*.csv
 !data/processed/calibration_alpha_*.csv
+!data/real/
+!data/real/*.csv
 !data/sample/
 !data/sample/*.csv
 

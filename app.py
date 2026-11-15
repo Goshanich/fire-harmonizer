@@ -48,6 +48,7 @@ from src.data_loader import (
     filter_by_bbox_and_dates,
     generate_regional_sample_data,
     load_csv_dataset,
+    load_real_cordoba_dataset,
 )
 from src.harmonizer import HarmonizationPipeline, HarmonizationResult
 
@@ -76,6 +77,15 @@ PLOTLY_CONFIG: dict[str, Any] = {
 )
 def _load_sample_cached(region_key: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     return generate_regional_sample_data(region_key=region_key, force=False)
+
+
+@st.cache_data(
+    max_entries=2,
+    ttl=1800,
+    show_spinner="Loading real 2001–2025 NASA FIRMS archive...",
+)
+def _load_real_cordoba_cached() -> tuple[pd.DataFrame, pd.DataFrame]:
+    return load_real_cordoba_dataset()
 
 
 def _execute_harmonization(
@@ -160,9 +170,15 @@ def _load_regional_reference_cached(
     viirs_allowed_conf: tuple[str, ...],
     combination_mode: str,
     daynight_filter: str,
+    source_kind: str = "synthetic",
 ) -> tuple[HarmonizationResult, pd.DataFrame]:
-    """Load pre-computed calibration & full 2001–2026 reference baseline for short windows."""
-    ref_modis, ref_viirs = _load_sample_cached(region_key)
+    """Load pre-computed calibration & multi-decade reference baseline for short windows."""
+    if source_kind == "real_cordoba":
+        ref_modis, ref_viirs = _load_real_cordoba_cached()
+        cal_key = "cordoba_real"
+    else:
+        ref_modis, ref_viirs = _load_sample_cached(region_key)
+        cal_key = region_key
     ref_modis_dn = filter_by_bbox_and_dates(ref_modis, daynight=daynight_filter)
     ref_viirs_dn = filter_by_bbox_and_dates(ref_viirs, daynight=daynight_filter)
 
@@ -180,7 +196,7 @@ def _load_regional_reference_cached(
         and modis_min_conf == DEFAULT_MODIS_MIN_CONFIDENCE
         and tuple(sorted(viirs_allowed_conf)) == tuple(sorted(DEFAULT_VIIRS_CONFIDENCE))
     )
-    cal_df = _load_regional_calibration_csv(region_key) if use_default_csv else None
+    cal_df = _load_regional_calibration_csv(cal_key) if use_default_csv else None
     if cal_df is None or cal_df.empty:
         cal_df = ref_result.calibration_df.copy()
 
@@ -257,6 +273,7 @@ def _run_preset_full_bundle_cached(
     viirs_allowed_conf: tuple[str, ...],
     combination_mode: str,
     metric_choice: str,
+    source_kind: str = "synthetic",
 ) -> tuple[
     int,
     int,
@@ -267,8 +284,11 @@ def _run_preset_full_bundle_cached(
     pd.DataFrame,
     dict[str, Any],
 ]:
-    """End-to-end cached preset loading, filtering, harmonization, and climatology."""
-    raw_modis_df, raw_viirs_df = _load_sample_cached(region_key)
+    """End-to-end cached archive loading, filtering, harmonization, and climatology."""
+    if source_kind == "real_cordoba":
+        raw_modis_df, raw_viirs_df = _load_real_cordoba_cached()
+    else:
+        raw_modis_df, raw_viirs_df = _load_sample_cached(region_key)
     modis_filtered = filter_by_bbox_and_dates(
         raw_modis_df,
         bbox=bbox,
@@ -306,6 +326,7 @@ def _run_preset_full_bundle_cached(
             viirs_allowed_conf=viirs_allowed_conf,
             combination_mode=combination_mode,
             daynight_filter=daynight_filter,
+            source_kind=source_kind,
         )
         ext_overlap_df = ref_result.overlap_monthly_df
         ref_tm = ref_result.transition_metrics
@@ -1308,9 +1329,9 @@ def main() -> None:
     ):
         st.markdown(
             """
-- **Active Fire Cell (`0.01° × 0.01° ≈ 1 km²`)**: VIIRS (`375 m`) resolves sub-pixel fire clusters that MODIS (`1 km`) reports as a single hotspot, inflating raw detection counts by ~7–9× after March 2012. Gridding merges co-located detections within each `0.01°` grid cell per sensor and overpass (`Day`/`Night`) onto a standardized 1 km scale.
+- **Active Fire Cell (`0.01° × 0.01° ≈ 1 km²`)**: VIIRS (`375 m`) resolves sub-pixel fire clusters that MODIS (`1 km`) reports as a single hotspot, inflating raw detection counts after March 2012. Gridding merges co-located detections within each `0.01°` grid cell per sensor and overpass (`Day`/`Night`) onto a standardized 1 km scale.
 - **FRP (Fire Radiative Power, MW)**: Instantaneous radiative heat release measured in megawatts (`MW`). Total FRP reflects fire intensity and fuel consumption rate rather than raw pixel counts.
-- **Calibration Factor `α` (VIIRS → MODIS)**: Monthly day/night ratio derived from the `2012–2025` MODIS–VIIRS overlap period (`Day ~0.85`, `Night ~0.36`). Nighttime `α` is lower because VIIRS detects cooler, smaller nighttime smoldering fires invisible to MODIS at `1 km`.
+- **Calibration Factor `α` (VIIRS → MODIS)**: Monthly day/night ratio derived from the `2012–2025` MODIS–VIIRS overlap period (e.g. Córdoba real archive: `Day ~0.64`, `Night ~0.17`). Nighttime `α` is lower because VIIRS detects cooler, smaller nighttime smoldering fires invisible to MODIS at `1 km`.
 - **Z-score (`σ`) & IQR (`P25–P75`)**: Historical climatology (`2001–2025`) defines normal seasonal activity (`P25–P75` interquartile band). Values above `P75` are **Above Normal**, values below `P25` are **Below Normal**, and `Z > +1.5σ` flags a **Critical Anomaly**.
             """
         )
@@ -1321,19 +1342,33 @@ def main() -> None:
     with st.sidebar:
         st.header("⚙️ Control Panel")
 
+        real_source_label = "Real NASA FIRMS Archive — Córdoba (2001–2025)"
+        synth_source_label = "Synthetic Validation Benchmark (2001–2026)"
+        upload_source_label = "Upload CSV (FIRMS Archive)"
+        api_source_label = "Live NASA FIRMS Area API"
+
         source_mode = st.radio(
             "Data Source",
             options=[
-                "Synthetic Benchmark (2001–2026, Offline)",
-                "Upload CSV (FIRMS Archive)",
-                "Live NASA FIRMS Area API",
+                real_source_label,
+                synth_source_label,
+                upload_source_label,
+                api_source_label,
             ],
             index=0,
             help=(
-                "Choose the controlled 2001–2026 Synthetic Benchmark (Ground-Truth Recovery Test), "
-                "upload real MODIS/VIIRS CSVs from FIRMS Archive Download, or query live NRT detections via the FIRMS Area API."
+                "Use the official 2001–2025 NASA FIRMS satellite archive for Córdoba (MODIS C6.1 + VIIRS C2), "
+                "explore the synthetic validation benchmark across 3 biomes, upload custom FIRMS CSVs, "
+                "or query live NRT detections via the FIRMS Area API."
             ),
         )
+
+        is_real_cordoba_mode = source_mode == real_source_label
+        if is_real_cordoba_mode and st.session_state.get("last_source_mode") != source_mode:
+            st.session_state["selected_region"] = "cordoba_argentina"
+            st.session_state["last_preset"] = "cordoba_argentina"
+            _apply_bbox_to_state(REGION_PRESETS["cordoba_argentina"]["bbox"])
+        st.session_state["last_source_mode"] = source_mode
 
         st.subheader("🌍 Region & Bounding Box")
         preset_keys = list(REGION_PRESETS.keys())
@@ -1342,7 +1377,11 @@ def main() -> None:
             options=preset_keys,
             format_func=lambda k: REGION_PRESETS[k]["name"],
             key="selected_region",
-            help="Select a benchmark fire-monitoring region (Córdoba/CONAE, Ukraine, or California).",
+            disabled=is_real_cordoba_mode,
+            help=(
+                "Locked to Córdoba Province when viewing the Real NASA FIRMS Córdoba archive; "
+                "all 3 regional biomes are unlocked in Synthetic Benchmark, Upload CSV, and Live API modes."
+            ),
         )
         if region_key != st.session_state["last_preset"]:
             st.session_state["last_preset"] = region_key
@@ -1614,8 +1653,13 @@ def main() -> None:
     end_date_str = f"{year_max:04d}-12-31"
     viirs_conf_tuple = tuple(sorted(viirs_conf))
 
-    if source_mode == "Synthetic Benchmark (2001–2026, Offline)":
-        active_region_label = REGION_PRESETS[region_key]["name"]
+    if source_mode in (real_source_label, synth_source_label):
+        source_kind = "real_cordoba" if is_real_cordoba_mode else "synthetic"
+        active_region_label = (
+            "Córdoba Province, Argentina (Real NASA FIRMS 2001–2025)"
+            if is_real_cordoba_mode
+            else f"{REGION_PRESETS[region_key]['name']} (Synthetic Benchmark)"
+        )
         (
             modis_count,
             viirs_count,
@@ -1635,6 +1679,7 @@ def main() -> None:
             viirs_allowed_conf=viirs_conf_tuple,
             combination_mode=combo_mode,
             metric_choice=metric_choice,
+            source_kind=source_kind,
         )
         if result.monthly_df.empty:
             st.warning(
@@ -1643,7 +1688,7 @@ def main() -> None:
             )
             st.stop()
     else:
-        if source_mode == "Upload CSV (FIRMS Archive)":
+        if source_mode == upload_source_label:
             if not uploaded_files:
                 st.warning("Upload one or more MODIS/VIIRS CSV files in the sidebar to run harmonization.")
                 st.stop()
@@ -1655,7 +1700,7 @@ def main() -> None:
             if raw_modis_df.empty and raw_viirs_df.empty:
                 st.info(
                     "Click **Fetch Data via FIRMS API** in the sidebar to load near real-time "
-                    "NASA FIRMS detections for the selected Bounding Box, or switch to the Synthetic Benchmark."
+                    "NASA FIRMS detections for the selected Bounding Box, or switch to the Real NASA FIRMS Archive."
                 )
                 st.stop()
             active_region_label = f"Live FIRMS API ({REGION_PRESETS[region_key]['name']})"
@@ -1686,7 +1731,7 @@ def main() -> None:
         )
         unique_years_count = int(all_dates.astype(str).str[:4].nunique()) if not all_dates.empty else 0
         needs_reference_cal = (
-            source_mode == "Live NASA FIRMS Area API"
+            source_mode == api_source_label
             or unique_years_count < 2
         )
 
@@ -1695,12 +1740,14 @@ def main() -> None:
         ext_overlap_df = None
         ref_tm = None
         if needs_reference_cal:
+            ref_kind = "real_cordoba" if region_key == "cordoba_argentina" else "synthetic"
             ref_result, ext_cal_df = _load_regional_reference_cached(
                 region_key=region_key,
                 modis_min_conf=modis_min_conf,
                 viirs_allowed_conf=viirs_conf_tuple,
                 combination_mode=combo_mode,
                 daynight_filter=daynight_option,
+                source_kind=ref_kind,
             )
             ext_overlap_df = ref_result.overlap_monthly_df
             ref_tm = ref_result.transition_metrics
@@ -1751,23 +1798,33 @@ def main() -> None:
         f"**Region:** {active_region_label} · **BBox Area:** {area_km2:,.0f} km² · "
         f"**Filtered Detections:** MODIS `{modis_count:,}` | VIIRS `{viirs_count:,}`"
     )
-    if source_mode == "Synthetic Benchmark (2001–2026, Offline)":
-        st.caption(
-            "🧪 **Synthetic Benchmark Mode (Ground-Truth Recovery Test):** "
-            "Offline simulation (`data/sample/`) with known latent fire activity used to verify "
+    if source_mode == real_source_label:
+        st.success(
+            "✅ Real NASA FIRMS Satellite Archive: MODIS C6.1 (MCD14DL) + Suomi NPP VIIRS C2 (VNP14IMG) "
+            "· Córdoba Province, Argentina (2001–2025)."
+        )
+    elif source_mode == synth_source_label:
+        st.warning(
+            "🧪 **DEMO / Benchmark (Synthetic Validation 2001–2026):** "
+            "Offline ground-truth recovery test (`data/sample/`) with known latent fire activity used to verify "
             "2012 step-jump suppression and out-of-sample α recovery. For real satellite observations, "
-            "use **Upload CSV (FIRMS Archive)** or **Live NASA FIRMS Area API** in the sidebar."
+            "use **Real NASA FIRMS Archive — Córdoba (2001–2025)**, **Upload CSV**, or **Live NASA FIRMS Area API**."
         )
     if is_ref_mode:
         short_mode_title = (
             "Short-Window Mode (< 2 years · Live NRT API)"
-            if source_mode == "Live NASA FIRMS Area API"
+            if source_mode == api_source_label
             else "Short-Window Mode (< 2 years)"
+        )
+        cal_file_label = (
+            "calibration_alpha_cordoba_real.csv"
+            if (is_real_cordoba_mode or region_key == "cordoba_argentina")
+            else f"calibration_alpha_{region_key}.csv"
         )
         st.info(
             f"ℹ️ **{short_mode_title}:** "
             f"applying pre-computed regional calibration factors `α(m, daynight)` from "
-            f"`data/processed/calibration_alpha_{region_key}.csv` and the 2001–2025 baseline climatology "
+            f"`data/processed/{cal_file_label}` and the 2001–2025 baseline climatology "
             f"(active window: `{tm.get('live_raw_points', 0):.0f}` raw detections → "
             f"`{tm.get('live_gridded_cells', 0):.0f}` 0.01° cells → "
             f"`{tm.get('live_harmonized_hotspots', 0):.1f}` harmonized hotspots)."
@@ -1976,10 +2033,15 @@ def main() -> None:
         )
 
         if is_ref_mode:
+            cal_csv_name = (
+                "calibration_alpha_cordoba_real.csv"
+                if (is_real_cordoba_mode or region_key == "cordoba_argentina")
+                else f"calibration_alpha_{region_key}.csv"
+            )
             st.caption(
                 f"2012 transition diagnostics and overlap R² below reflect the reference archive for "
                 f"`{REGION_PRESETS[region_key]['name']}` (2001–2025 complete years), as the active window spans < 2 years "
-                f"and uses pre-calibrated `calibration_alpha_{region_key}.csv`."
+                f"and uses pre-calibrated `{cal_csv_name}`."
             )
 
         if not has_overlap:
