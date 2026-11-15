@@ -1478,11 +1478,11 @@ def main() -> None:
                 st.caption(f"Available FIRMS range: {bounds_text}")
 
             api_days = st.slider(
-                "Window Length (days, 10-day chunks)",
+                "Window Length (days, 5-day chunks)",
                 min_value=1,
                 max_value=30,
                 value=5,
-                help="FIRMS Area API serves up to 10 days per call; longer windows are fetched in chunks.",
+                help="FIRMS Area API serves up to 5 days per call; longer windows are fetched in chunks.",
             )
             api_end_default = common_max_dt or date.today()
             api_start_default = api_end_default - timedelta(days=int(api_days) - 1)

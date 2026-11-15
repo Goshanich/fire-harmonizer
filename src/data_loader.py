@@ -284,7 +284,7 @@ class FIRMSApiClient:
         self,
         source: str,
         bbox: tuple[float, float, float, float],
-        day_range: int = 10,
+        day_range: int = 5,
         target_date: Optional[str] = None,
         use_cache: bool = True,
     ) -> pd.DataFrame:
@@ -297,14 +297,14 @@ class FIRMSApiClient:
         bbox : tuple
             (west, south, east, north) in decimal degrees.
         day_range : int
-            1 to 10 days allowed by FIRMS Area API per request.
+            1 to 5 days allowed by FIRMS Area API per request.
         target_date : str, optional
             Starting YYYY-MM-DD date; defaults to today UTC/local date.
         """
         if source not in FIRMS_SOURCES:
             raise ValueError(f"Unsupported FIRMS source '{source}'. Valid: {list(FIRMS_SOURCES)}")
-        if not 1 <= int(day_range) <= 10:
-            raise ValueError("FIRMS Area API supports day_range between 1 and 10.")
+        if not 1 <= int(day_range) <= 5:
+            raise ValueError("FIRMS Area API supports day_range between 1 and 5.")
 
         key = self._require_map_key()
         west, south, east, north = (round(float(v), 4) for v in bbox)
@@ -351,7 +351,7 @@ class FIRMSApiClient:
         end_date: str,
         use_cache: bool = True,
     ) -> pd.DataFrame:
-        """Fetch multi-day range by chunking into 10-day FIRMS Area API windows."""
+        """Fetch multi-day range by chunking into 5-day FIRMS Area API windows."""
         start_dt = date.fromisoformat(start_date)
         end_dt = date.fromisoformat(end_date)
         if end_dt < start_dt:
@@ -361,7 +361,7 @@ class FIRMSApiClient:
         cursor = start_dt
         while cursor <= end_dt:
             remaining = (end_dt - cursor).days + 1
-            span = min(10, remaining)
+            span = min(5, remaining)
             df_chunk = self.fetch_area_csv(
                 source=source,
                 bbox=bbox,
