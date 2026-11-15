@@ -1034,26 +1034,32 @@ class _SafeLayerControl(folium.LayerControl):
                 var _map = {{ this._parent.get_name() }};
                 var _bboxBounds = L.latLngBounds({{ this.bbox_bounds|tojson }});
                 var _lastWidth = 0;
+                var _lastHeight = 0;
                 var _refreshMapSize = function() {
                     var el = _map.getContainer();
                     if (!el) return;
                     var w = el.offsetWidth;
-                    if (w > 0 && w !== _lastWidth) {
+                    var h = el.offsetHeight;
+                    if (w > 0 && h > 0 && (w !== _lastWidth || h !== _lastHeight)) {
                         var firstShow = (_lastWidth === 0);
                         _lastWidth = w;
+                        _lastHeight = h;
                         _map.invalidateSize(false);
                         _map.options.zoomSnap = 0.05;
                         _map.options.zoomDelta = 0.5;
                         _map.options.bounceAtZoomLimits = false;
-                        var minZoomForWidth = Math.max(2.2, Math.ceil((Math.log2(Math.max(w, 400) / 256) + 0.25) * 20) / 20);
-                        _map.setMinZoom(minZoomForWidth);
-                        _map.setMaxBounds([[-85, -179.9], [85, 179.9]]);
+
+                        var minZoomForHeight = Math.ceil(Math.log2(h / 256) * 20) / 20;
+                        minZoomForHeight = Math.max(1.5, minZoomForHeight);
+                        _map.setMinZoom(minZoomForHeight);
+                        _map.setMaxBounds([[-85, -1000000], [85, 1000000]]);
+
                         if (firstShow) {
                             var fitZ = _map.getBoundsZoom(_bboxBounds, false, L.point(16, 16));
-                            var targetZoom = Math.max(fitZ, minZoomForWidth);
+                            var targetZoom = Math.max(fitZ, minZoomForHeight);
                             _map.setView(_bboxBounds.getCenter(), targetZoom, {animate: false});
-                        } else if (_map.getZoom() < minZoomForWidth) {
-                            _map.setZoom(minZoomForWidth, {animate: false});
+                        } else if (_map.getZoom() < minZoomForHeight) {
+                            _map.setZoom(minZoomForHeight, {animate: false});
                         }
                     }
                 };
@@ -1080,15 +1086,15 @@ def _build_folium_map(
         zoom_start=_estimate_zoom_for_bbox(bbox),
         tiles=None,
         zoom_control=False,
-        world_copy_jump=False,
-        no_wrap=True,
+        world_copy_jump=True,
+        no_wrap=False,
         min_zoom=2,
         max_bounds=True,
         max_bounds_viscosity=1.0,
         min_lat=-85.0,
         max_lat=85.0,
-        min_lon=-180.0,
-        max_lon=180.0,
+        min_lon=-1000000.0,
+        max_lon=1000000.0,
     )
     fmap.get_root().header.add_child(
         folium.Element(
@@ -1102,8 +1108,7 @@ def _build_folium_map(
     folium.TileLayer(
         "OpenStreetMap",
         name="OpenStreetMap",
-        no_wrap=True,
-        bounds=[[-85, -180], [85, 180]],
+        no_wrap=False,
     ).add_to(fmap)
 
     # Active Bounding Box polygon
