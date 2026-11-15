@@ -35,11 +35,11 @@ from src.config import (
     DEFAULT_MODIS_MIN_CONFIDENCE,
     DEFAULT_VIIRS_CONFIDENCE,
     FIRMS_ARCHIVE_URL,
+    FIRMS_COUNTRY_URL,
     FIRMS_MAP_KEY_URL,
     FIRMS_MAP_URL,
     FIRMS_PORTAL_URL,
     PROCESSED_DIR,
-    QUICK_LOCATIONS,
     REGION_PRESETS,
     YEAR_RANGE,
     build_firms_map_url,
@@ -66,7 +66,7 @@ from src.harmonizer import (
 
 st.set_page_config(
     page_title="MODIS & VIIRS Fire Harmonizer | NASA Space Apps 2026",
-    page_icon="🔥",
+    page_icon=None,
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -495,10 +495,6 @@ def _init_session_state() -> None:
         st.session_state["api_availability_attempted"] = False
     if "api_fetch_meta" not in st.session_state:
         st.session_state["api_fetch_meta"] = None
-    if "quick_location" not in st.session_state:
-        st.session_state["quick_location"] = "Custom Coordinates (Manual Input)"
-    if "last_quick_location" not in st.session_state:
-        st.session_state["last_quick_location"] = "Custom Coordinates (Manual Input)"
     if "api_failed_windows" not in st.session_state:
         st.session_state["api_failed_windows"] = []
 
@@ -1499,7 +1495,7 @@ def main() -> None:
         unsafe_allow_html=True,
     )
 
-    st.title("🔥 MODIS & VIIRS Hot Spots Harmonizer — Burning Activity Calendar")
+    st.title("MODIS & VIIRS Hot Spots Harmonizer — Burning Activity Calendar")
     st.caption(
         "NASA Space Apps Challenge 2026 (NASA & CONAE) · "
         "Removing the 2012 MODIS (1 km) → VIIRS (375 m) sensor discontinuity to produce "
@@ -1507,7 +1503,7 @@ def main() -> None:
     )
 
     with st.expander(
-        "📖 What do these metrics mean? (Quick Guide to FRP, α, Z-score & 0.01° Grid)",
+        "What do these metrics mean? (Quick Guide to FRP, α, Z-score & 0.01° Grid)",
         expanded=False,
     ):
         st.markdown(
@@ -1523,10 +1519,10 @@ def main() -> None:
     # Sidebar Controls
     # -----------------------------------------------------------------------
     with st.sidebar:
-        st.header("⚙️ Control Panel")
+        st.header("Control Panel")
 
-        ref_mode_label = "📌 Reference Case — Córdoba, Argentina (2001–2025)"
-        explore_mode_label = "🌐 Explore Any Region (Live API / Custom CSV)"
+        ref_mode_label = "Reference Case — Córdoba, Argentina (2001–2025)"
+        explore_mode_label = "Explore Any Region (Live API / Custom CSV)"
         real_source_label = "Real NASA FIRMS Archive — Córdoba (2001–2025)"
         api_source_label = "Live NASA FIRMS Area API"
         upload_source_label = "Upload CSV (FIRMS Archive)"
@@ -1563,38 +1559,14 @@ def main() -> None:
             _apply_bbox_to_state(REGION_PRESETS["cordoba_argentina"]["bbox"])
         st.session_state["last_source_mode"] = source_mode
 
-        st.subheader("🌍 Region & Bounding Box")
-        quick_loc = "Custom Coordinates (Manual Input)"
-        region_key = st.session_state.get("selected_region", "cordoba_argentina")
-
+        st.subheader("Region & Bounding Box")
+        region_key = "cordoba_argentina"
+        st.session_state["selected_region"] = region_key
         if not is_explore_mode:
-            preset_keys = list(REGION_PRESETS.keys())
-            region_key = st.selectbox(
-                "Region Preset",
-                options=preset_keys,
-                format_func=lambda k: REGION_PRESETS[k]["name"],
-                key="selected_region",
-                disabled=True,
-                help="Locked to Córdoba Province for the Real NASA FIRMS 2001–2025 archive.",
-            )
-            if region_key != st.session_state["last_preset"]:
+            st.caption(f"Reference Case: **{REGION_PRESETS[region_key]['name']}**")
+            if st.session_state.get("last_preset") != region_key:
                 st.session_state["last_preset"] = region_key
                 _apply_bbox_to_state(REGION_PRESETS[region_key]["bbox"])
-        else:
-            quick_loc = st.selectbox(
-                "Quick Locations (Helper BBox)",
-                options=list(QUICK_LOCATIONS.keys()),
-                key="quick_location",
-                help=(
-                    "Populate the Bounding Box with coordinates for curated global regions, "
-                    "or select Custom Coordinates (Manual Input) to enter any bounds."
-                ),
-            )
-            if quick_loc != st.session_state["last_quick_location"]:
-                st.session_state["last_quick_location"] = quick_loc
-                helper_bbox = QUICK_LOCATIONS[quick_loc]
-                if helper_bbox is not None:
-                    _apply_bbox_to_state(helper_bbox)
 
         with st.form("bbox_coords_form", border=False):
             col_w, col_s = st.columns(2)
@@ -1628,7 +1600,7 @@ def main() -> None:
                 help="Northern latitude bound in decimal degrees (-90 to 90).",
             )
             apply_bbox_clicked = st.form_submit_button(
-                "🎯 Apply Coordinates & Update Map",
+                "Apply Coordinates & Update Map",
                 type="primary",
                 width="stretch",
             )
@@ -1650,7 +1622,7 @@ def main() -> None:
         firms_compare_url = build_firms_map_url(active_bbox, zoom=_estimate_zoom_for_bbox(active_bbox))
 
         st.link_button(
-            "🌐 Compare in Official NASA FIRMS Fire Map",
+            "Compare in Official NASA FIRMS Fire Map",
             firms_compare_url,
             width="stretch",
             help="Open the current Bounding Box center on NASA's official FIRMS Global Fire Map.",
@@ -1667,13 +1639,13 @@ def main() -> None:
         if source_mode == upload_source_label:
             st.info(
                 f"Upload CSV exports from [FIRMS Archive Download]({FIRMS_ARCHIVE_URL}) "
-                "(MODIS and/or VIIRS)."
+                f"or [Country Yearly Summary]({FIRMS_COUNTRY_URL}) (MODIS and/or VIIRS)."
             )
-            with st.expander("📥 Step-by-Step: How to Download Multi-Year NASA FIRMS Archives", expanded=False):
+            with st.expander("Step-by-Step: How to Download Multi-Year NASA FIRMS Archives", expanded=False):
                 st.markdown(
                     f"""
-1. Open [NASA FIRMS Archive Download]({FIRMS_ARCHIVE_URL}).
-2. Draw or enter your Bounding Box (or upload the `.geojson` AOI above) and choose date range `2001–Present`.
+1. Open [NASA FIRMS Archive Download]({FIRMS_ARCHIVE_URL}) for a custom Bounding Box, or [NASA FIRMS Country Yearly Summary]({FIRMS_COUNTRY_URL}) for country-level annual CSVs.
+2. Draw or enter your Bounding Box and choose date range `2001–Present`.
 3. Submit **two separate requests**:
    - **MODIS Standard (`C6.1 / MCD14ML`)** — covers `2001–Present`
    - **VIIRS Suomi NPP (`C2 / VNP14IMGML`)** — covers `2012–Present` (calibration target; keep ≤ `200 MB` per upload)
@@ -1796,7 +1768,7 @@ def main() -> None:
                     api_days=int(api_days),
                 )
                 if not is_api_bbox_ok:
-                    st.error(f"❌ {api_bbox_err}")
+                    st.error(f"{api_bbox_err}")
                 else:
                     try:
                         req_end = api_start_date + timedelta(days=int(api_days) - 1)
@@ -1853,7 +1825,7 @@ def main() -> None:
                     except FIRMSApiError as exc:
                         st.error(str(exc))
 
-        st.subheader("🔬 Filters & Calibration")
+        st.subheader("Filters & Calibration")
         max_year_bound = max(YEAR_RANGE[1], date.today().year) if is_explore_mode else YEAR_RANGE[1]
         year_min, year_max = st.slider(
             "Year Range",
@@ -1920,7 +1892,7 @@ def main() -> None:
         api_days=int(api_days),
     )
     if not is_bbox_valid:
-        st.error(f"❌ Invalid Bounding Box: {bbox_error_msg}")
+        st.error(f"Invalid Bounding Box: {bbox_error_msg}")
         st.stop()
 
     if not viirs_conf:
@@ -1970,11 +1942,7 @@ def main() -> None:
             )
             st.stop()
     else:
-        loc_display = (
-            quick_loc
-            if quick_loc != "Custom Coordinates (Manual Input)"
-            else f"Custom Global BBox [{active_bbox[0]:.2f}, {active_bbox[1]:.2f}, {active_bbox[2]:.2f}, {active_bbox[3]:.2f}]"
-        )
+        loc_display = f"Custom Global BBox [{active_bbox[0]:.2f}, {active_bbox[1]:.2f}, {active_bbox[2]:.2f}, {active_bbox[3]:.2f}]"
         slug_chars = "".join(c.lower() if c.isalnum() else "_" for c in loc_display)
         export_slug = "_".join(part for part in slug_chars.split("_") if part)[:48] or "custom_bbox"
 
@@ -1988,7 +1956,7 @@ def main() -> None:
                     dayfirst=dayfirst_dates,
                 )
             except ValueError as exc:
-                st.error(f"❌ CSV Load Error: {exc}")
+                st.error(f"CSV Load Error: {exc}")
                 st.stop()
             active_region_label = f"Custom FIRMS CSV — {loc_display}"
             cache_source_key = (
@@ -2114,18 +2082,18 @@ def main() -> None:
     )
     if is_real_cordoba_mode:
         st.success(
-            "✅ Real NASA FIRMS Satellite Archive: MODIS C6.1 (MCD14DL) + Suomi NPP VIIRS C2 (VNP14IMG) "
+            "Real NASA FIRMS Satellite Archive: MODIS C6.1 (MCD14DL) + Suomi NPP VIIRS C2 (VNP14IMG) "
             "· Córdoba Province, Argentina (2001–2025)."
         )
     if (not is_in_window_explore) and (not has_overlap):
         st.warning(
-            "⚠️ **Uncalibrated Series (α = 1.0 fallback):** "
+            "**Uncalibrated Series (α = 1.0 fallback):** "
             "No paired MODIS–VIIRS overlap was found in the selected window/archive, so cross-sensor scaling α could not be calibrated."
         )
     if is_live_api_active and st.session_state.get("api_failed_windows"):
         failed_list = st.session_state["api_failed_windows"]
         st.warning(
-            f"⚠️ **Partial Live API Response ({len(failed_list)} 5-day chunk(s) failed):** "
+            f"**Partial Live API Response ({len(failed_list)} 5-day chunk(s) failed):** "
             + "; ".join(failed_list)
         )
     if csv_report is not None:
@@ -2138,12 +2106,12 @@ def main() -> None:
             disjoint_bbox = de < aw or dw > ae or dn < as_ or ds > an
         if disjoint_bbox:
             st.warning(
-                f"⚠️ Uploaded CSV extent `[{data_bb[0]:.2f}, {data_bb[1]:.2f}, {data_bb[2]:.2f}, {data_bb[3]:.2f}]` "
+                f"Uploaded CSV extent `[{data_bb[0]:.2f}, {data_bb[1]:.2f}, {data_bb[2]:.2f}, {data_bb[3]:.2f}]` "
                 f"does not overlap active BBox `[{active_bbox[0]:.2f}, {active_bbox[1]:.2f}, {active_bbox[2]:.2f}, {active_bbox[3]:.2f}]`."
             )
         if total_mb >= 180.0:
-            st.warning(f"⚠️ Uploaded CSV size ({total_mb:.1f} MB) is near Streamlit's 200 MB per-upload limit.")
-        with st.expander("📋 CSV Load Diagnostics", expanded=False):
+            st.warning(f"Uploaded CSV size ({total_mb:.1f} MB) is near Streamlit's 200 MB per-upload limit.")
+        with st.expander("CSV Load Diagnostics", expanded=False):
             st.markdown(
                 f"- **Rows Read:** `{csv_report['rows_read']:,}` → **Kept:** `{csv_report['rows_kept']:,}` "
                 f"(dropped coords: `{csv_report['rows_dropped_coords']:,}`, invalid dates: `{csv_report['rows_dropped_dates']:,}`)\n"
@@ -2157,7 +2125,7 @@ def main() -> None:
             else f"calibration_alpha_{region_key}.csv"
         )
         st.info(
-            f"ℹ️ **Short-Window Mode (< 2 years):** "
+            f"**Short-Window Mode (< 2 years):** "
             f"applying pre-computed regional calibration factors `α(m, daynight)` from "
             f"`data/processed/{cal_file_label}` and the 2001–2025 baseline climatology "
             f"(active window: `{tm.get('live_raw_points', 0):.0f}` raw detections → "
@@ -2170,14 +2138,14 @@ def main() -> None:
         n_m_cells = int(in_win_meta["n_modis_cells"])
         n_v_cells = int(in_win_meta["n_viirs_cells"])
         st.info(
-            f"🌐 **Custom Global Window ({eff_start_key} .. {eff_end_key}):** "
+            f"**Custom Global Window ({eff_start_key} .. {eff_end_key}):** "
             f"Active BBox `[{active_bbox[0]:.3f}, {active_bbox[1]:.3f}, {active_bbox[2]:.3f}, {active_bbox[3]:.3f}]` "
             f"· Area `{area_km2:,.0f} km²` · `alpha from {n_m_cells} MODIS / {n_v_cells} VIIRS 0.01° cells` "
             f"({in_win_meta['mode_label']})."
         )
         if in_win_meta["low_sample_warning"]:
             st.warning(
-                f"⚠️ **Below 30 Active 0.01° Cells Threshold:** "
+                f"**Below 30 Active 0.01° Cells Threshold:** "
                 f"Detected `{n_m_cells}` MODIS and `{n_v_cells}` VIIRS 0.01° cells (< {in_win_meta['min_cells_threshold']} cells). "
                 "Using `alpha = 1.0` (`VIIRS native, not harmonized to MODIS`) rather than cross-sensor scaling."
             )
@@ -2313,16 +2281,16 @@ def main() -> None:
     # -----------------------------------------------------------------------
     tab1, tab2, tab3 = st.tabs(
         [
-            "📅 Burning Activity Calendar",
-            "📊 Harmonization Proof (Raw vs. Harmonized)",
-            "🗺️ Geospatial Explorer & CSV Export",
+            "Burning Activity Calendar",
+            "Harmonization Proof (Raw vs. Harmonized)",
+            "Geospatial Explorer & CSV Export",
         ]
     )
 
     # === TAB 1: BURNING ACTIVITY CALENDAR ===
     with tab1:
         if is_in_window_explore:
-            st.subheader("📅 Operational Window — Daily Fire Activity")
+            st.subheader("Operational Window — Daily Fire Activity")
             st.plotly_chart(
                 _make_live_daily_chart(
                     gridded_df=result.gridded_df,
@@ -2336,7 +2304,7 @@ def main() -> None:
             st.subheader("Daily Per-Sensor Counts & Separate FRP Breakdown")
             _render_daily_breakdown_table(daily_breakdown_df)
         else:
-            with st.expander("ℹ️ How to Read This Calendar", expanded=False):
+            with st.expander("How to Read This Calendar", expanded=False):
                 st.markdown(
                     """
 - **Hotspot Cell ≠ Fire Perimeter:** Each unit is a unique active `0.01° × 0.01°` (`~1 km`) grid cell per day and Day/Night overpass (`satellite + overpass`), not individual burned-area scars.
@@ -2348,7 +2316,7 @@ def main() -> None:
 
             nonstat = check_series_nonstationarity(result.monthly_df, value_col=metric_choice)
             if nonstat.get("has_significant_trend"):
-                st.warning(f"📉 **Non-Stationary Baseline:** {nonstat['message']}")
+                st.warning(f"**Non-Stationary Baseline:** {nonstat['message']}")
 
             color_scale_mode = st.radio(
                 "Color Scale Mode",
@@ -2467,7 +2435,7 @@ def main() -> None:
                 value_col="harmonized_frp" if use_frp else "harmonized_cells",
             )
             if not crit_df.empty:
-                st.subheader("🔥 Critical Fire Risk Windows (52-Week Exceedance P > P75)")
+                st.subheader("Critical Fire Risk Windows (52-Week Exceedance P > P75)")
                 crit_weeks = crit_df[crit_df["is_critical"]]
                 top_crit = crit_df.sort_values(["p_exceedance", "mean_weekly"], ascending=False).iloc[0]
                 if not crit_weeks.empty:
@@ -2487,7 +2455,7 @@ def main() -> None:
     # === TAB 2: HARMONIZATION PROOF ===
     with tab2:
         if is_in_window_explore and in_win_meta is not None:
-            st.subheader("📊 In-Window Sensor Comparison & Honest Calibration")
+            st.subheader("In-Window Sensor Comparison & Honest Calibration")
             st.plotly_chart(
                 _make_live_daily_chart(
                     gridded_df=result.gridded_df,
@@ -2574,7 +2542,7 @@ def main() -> None:
 
             if not has_overlap:
                 st.warning(
-                    "⚠️ **No MODIS–VIIRS overlap in the selected window:** "
+                    "**No MODIS–VIIRS overlap in the selected window:** "
                     "Cross-sensor 2012 step-jump suppression, residual overlap bias, and regression metrics "
                     "require paired MODIS and VIIRS observations (2012–2025). Expand the Year Range or include "
                     "both sensors to evaluate transition metrics."
@@ -2663,7 +2631,7 @@ def main() -> None:
             f"([NASA FIRMS]({FIRMS_PORTAL_URL}) / [Global Fire Map]({FIRMS_MAP_URL}))."
         )
         st.link_button(
-            "🌐 Compare in Official NASA FIRMS Fire Map",
+            "Compare in Official NASA FIRMS Fire Map",
             firms_compare_url,
             width="stretch",
             help="Open this exact region and zoom level on NASA FIRMS Official Fire Map.",
@@ -2717,7 +2685,7 @@ def main() -> None:
             components.html(map_html, height=540, scrolling=False)
 
         st.divider()
-        st.subheader("📥 Export Harmonized Datasets (CSV)")
+        st.subheader("Export Harmonized Datasets (CSV)")
         d1, d2 = st.columns(2)
         d3, d4 = st.columns(2)
 
@@ -2776,7 +2744,7 @@ def main() -> None:
             "transition_metrics": {k: (float(v) if isinstance(v, (int, float, np.number)) else v) for k, v in tm.items()},
         }
         st.download_button(
-            label="📄 run_metadata_manifest.json",
+            label="run_metadata_manifest.json",
             data=json.dumps(manifest_payload, indent=2).encode("utf-8"),
             file_name=f"run_metadata_manifest_{export_slug}.json",
             mime="application/json",

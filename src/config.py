@@ -43,6 +43,7 @@ FIRMS_PYTHON_GUIDE_URL: str = (
 )
 FIRMS_MAP_KEY_URL: str = "https://firms.modaps.eosdis.nasa.gov/api/map_key/"
 FIRMS_ARCHIVE_URL: str = "https://firms.modaps.eosdis.nasa.gov/download/"
+FIRMS_COUNTRY_URL: str = "https://firms.modaps.eosdis.nasa.gov/country/"
 FIRMS_FAQ_URL: str = "https://www.earthdata.nasa.gov/data/tools/firms/faq"
 FIRMS_ATTRIBUTES_URL: str = (
     "https://www.earthdata.nasa.gov/data/tools/firms/active-fire-data-attributes-modis-viirs"
@@ -196,16 +197,8 @@ def build_firms_map_url(
 
 
 # ---------------------------------------------------------------------------
-# Global Quick Locations & Bounding Box Validation
+# Bounding Box Validation
 # ---------------------------------------------------------------------------
-QUICK_LOCATIONS: dict[str, Optional[tuple[float, float, float, float]]] = {
-    "Custom Coordinates (Manual Input)": None,
-    "Banff National Park, Canada": (-117.317, 50.705, -115.165, 52.271),
-    "Córdoba Province, Argentina": (-65.6, -32.6, -63.8, -30.2),
-    "Ukraine Forest & Steppe": (29.5, 46.5, 38.5, 51.8),
-    "Northern & Central California, USA": (-123.5, 36.5, -118.5, 41.5),
-    "Amazon Basin (Manaus / Pará), Brazil": (-60.0, -6.0, -52.0, -1.0),
-}
 
 
 def validate_bbox(
@@ -289,69 +282,6 @@ REGION_PRESETS: dict[str, dict[str, Any]] = {
             (-32.10, -64.60, 0.25, 0.20),
             (-30.65, -64.30, 0.22, 0.22),
             (-31.40, -65.15, 0.24, 0.20),
-        ],
-    },
-    "ukraine_forest_steppe": {
-        "name": "Ukraine Forest & Steppe Zones",
-        "name_ru": "Лесные и степные зоны Украины",
-        "description": (
-            "Polissya, Forest-Steppe & Northern Steppe — bimodal fire regime with "
-            "spring agricultural/grassland burning (Apr) and late-summer drought peaks (Jul–Sep)."
-        ),
-        "bbox": (29.5, 46.5, 38.5, 51.8),
-        "center": (49.15, 34.0),
-        "zoom": 6,
-        "peak_months": [4, 7, 8, 9],
-        "monthly_weights": [
-            0.10, 0.15, 0.85, 1.85, 0.90, 0.65,
-            1.35, 2.05, 1.80, 0.85, 0.30, 0.15,
-        ],
-        "anomalous_years": {
-            2007: 1.65,
-            2010: 1.85,
-            2015: 1.75,
-            2020: 2.25,
-            2022: 2.40,
-        },
-        "base_monthly_events": 55,
-        "hotspot_centers": [
-            (51.20, 30.20, 0.35, 0.55),
-            (50.45, 32.80, 0.45, 0.70),
-            (49.55, 36.20, 0.55, 0.85),
-            (48.35, 35.10, 0.50, 0.80),
-            (47.40, 33.40, 0.45, 0.75),
-            (48.90, 37.60, 0.40, 0.55),
-        ],
-    },
-    "california_usa": {
-        "name": "Northern & Central California, USA",
-        "name_ru": "Северная и Центральная Калифорния, США",
-        "description": (
-            "Sierra Nevada foothills, Sacramento Valley & Coastal Ranges — Mediterranean "
-            "fire regime with intense late-summer/autumn wildfire seasons (Jul–Oct)."
-        ),
-        "bbox": (-123.5, 36.5, -118.5, 41.5),
-        "center": (39.0, -121.0),
-        "zoom": 6,
-        "peak_months": [7, 8, 9, 10],
-        "monthly_weights": [
-            0.12, 0.15, 0.22, 0.35, 0.55, 1.05,
-            1.85, 2.55, 2.40, 1.70, 0.70, 0.20,
-        ],
-        "anomalous_years": {
-            2008: 1.70,
-            2018: 2.05,
-            2020: 2.50,
-            2021: 2.15,
-            2024: 1.80,
-        },
-        "base_monthly_events": 48,
-        "hotspot_centers": [
-            (40.55, -122.40, 0.45, 0.50),
-            (39.75, -121.45, 0.40, 0.45),
-            (38.90, -122.65, 0.40, 0.40),
-            (37.85, -120.15, 0.45, 0.45),
-            (37.10, -119.35, 0.35, 0.40),
         ],
     },
 }

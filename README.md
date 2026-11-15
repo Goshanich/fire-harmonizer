@@ -1,6 +1,6 @@
-# 🔥 Harmonization of MODIS and VIIRS Hot Spots (NASA Space Apps Challenge 2026)
+# Harmonization of MODIS and VIIRS Hot Spots (NASA Space Apps Challenge 2026)
 
-🌐 **Live Web App (Streamlit Community Cloud):** [https://fire-harmonizer-klk4prhsumtdpkv23tsafg.streamlit.app/](https://fire-harmonizer-klk4prhsumtdpkv23tsafg.streamlit.app/)
+**Live Web App (Streamlit Community Cloud):** [https://fire-harmonizer-klk4prhsumtdpkv23tsafg.streamlit.app/](https://fire-harmonizer-klk4prhsumtdpkv23tsafg.streamlit.app/)
 
 Web platform and statistical harmonization pipeline that removes the 2012 cross-sensor discontinuity between **MODIS (1 km)** and **VIIRS (375 m)** active fire detections to produce a climatology-ready **Burning Activity Calendar (2001–2026)** — built for the NASA & CONAE challenge [Harmonization of MODIS and VIIRS Hot Spots](https://www.spaceappschallenge.org/2026/challenges/modis-and-viirs-hot-spots/).
 
@@ -75,11 +75,11 @@ Dataset: **`21,330` MODIS C6.1 (`MCD14DL`)** and **`37,294` Suomi NPP VIIRS C2 (
 
 ## 4. Two-Mode Web Interface (`app.py`)
 
-1. **📌 Reference Case — Córdoba, Argentina (`2001–2025`):**
+1. **Reference Case — Córdoba, Argentina (`2001–2025`):**
    - Loads the official 2001–2025 NASA FIRMS archive (`data/real/`) or switches to the 3-biome Algorithmic Self-Consistency Benchmarks (`data/sample/`).
    - Interactive Burning Activity Calendar (`No Data` gray masking, Leave-One-Out Robust Z anomalies, 52-week `P > P75` Critical Risk Windows, non-stationarity check), Harmonization Proof, Folium Map + NASA GIBS / CONAE WMS overlays, and CSV + `run_metadata_manifest.json` downloads.
-2. **🌐 Explore Any Region (`Live API / Custom CSV / GeoJSON AOI`):**
-   - **Quick Locations** helper selector, manual BBox inputs, or **GeoJSON Polygon/BBox** upload (`.geojson` / `.json`).
+2. **Explore Any Region (`Live API / Custom CSV`):**
+   - Free global Bounding Box entry (`Min Lon`, `Min Lat`, `Max Lon`, `Max Lat`).
    - **Live NASA FIRMS Area API:** automatic **5-day chunking** per FIRMS specification, exponential backoff rate-limit retries, header validation prior to caching, and explicit warnings if any 5-day sub-window fails (`allow_partial=True`).
    - **Custom CSV Archive Upload:** supports comma/semicolon delimiters, optional `dayfirst` (`DD/MM/YYYY`) date parsing, CSV Load Diagnostics, and step-by-step FIRMS Archive instructions.
 
@@ -101,7 +101,7 @@ fire_harmonizer/
 │   ├── processed/           # Exported harmonized monthly series, α tables, and calendars
 │   └── raw/                 # Ignored local FIRMS ZIPs and validated API cache files
 ├── src/
-│   ├── config.py            # Endpoints, presets, QUICK_LOCATIONS, validate_bbox
+│   ├── config.py            # Endpoints, Córdoba reference preset, validate_bbox
 │   ├── data_loader.py       # FIRMS API client (backoff, 5-day chunks), CSV parser & diagnostics
 │   ├── harmonizer.py        # 4-stage pipeline, sum-ratio α, bootstrap CI, holdout & anomaly metrics
 │   └── analytics.py         # NaN-safe calendars, LOO Robust Z anomalies, 52-week critical windows
@@ -157,6 +157,6 @@ streamlit run app.py
 ### Official Data Citations & Links
 - **MODIS Active Fire (`MCD14DL`):** NASA FIRMS (`10.5067/FIRMS/MODIS/MCD14DL.NRT.0061`)
 - **VIIRS I-Band Active Fire (`VNP14IMGTDL`):** NASA FIRMS (`10.5067/FIRMS/VIIRS/VNP14IMGTDL.NRT.002`)
-- **NASA FIRMS Portals:** [FIRMS Portal](https://firms.modaps.eosdis.nasa.gov/) · [Global Fire Map](https://firms.modaps.eosdis.nasa.gov/map/) · [API Docs](https://firms.modaps.eosdis.nasa.gov/api/) · [Archive Download](https://firms.modaps.eosdis.nasa.gov/download/)
+- **NASA FIRMS Portals:** [FIRMS Portal](https://firms.modaps.eosdis.nasa.gov/) · [Global Fire Map](https://firms.modaps.eosdis.nasa.gov/map/) · [API Docs](https://firms.modaps.eosdis.nasa.gov/api/) · [Archive Download](https://firms.modaps.eosdis.nasa.gov/download/) · [Country Yearly Summary](https://firms.modaps.eosdis.nasa.gov/country/)
 - **CONAE Argentina:** [Catálogo de Geoservicios OGC CONAE](https://catalogos.conae.gov.ar/catalogo/catalogoGeoServiciosOGC.html) · [Focos de Calor CONAE](https://catalogos.conae.gov.ar/catalogo/actualizaciones.html)
 - **License:** [MIT License](LICENSE)

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from src.config import FIRMS_SOURCES, QUICK_LOCATIONS, validate_bbox
+from src.config import FIRMS_SOURCES, REGION_PRESETS, validate_bbox
 from src.harmonizer import (
     HarmonizationPipeline,
     build_daily_sensor_breakdown,
@@ -135,8 +135,8 @@ def test_two_month_window_oct_nov_has_no_missing_months() -> None:
 
 
 def test_bbox_validation_rules() -> None:
-    banff_bbox = QUICK_LOCATIONS["Banff National Park, Canada"]
-    assert banff_bbox == (-117.317, 50.705, -115.165, 52.271)
+    assert list(REGION_PRESETS.keys()) == ["cordoba_argentina"]
+    banff_bbox = (-117.317, 50.705, -115.165, 52.271)
 
     ok_banff, err_banff = validate_bbox(banff_bbox, is_live_api=True, max_span_deg=10.0, api_days=5)
     assert ok_banff is True and err_banff == ""
