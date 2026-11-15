@@ -136,7 +136,7 @@ def _run_harmonization_cached(
     )
 
 
-@st.cache_data(max_entries=5, show_spinner=False)
+@st.cache_data(max_entries=2, ttl=1800, show_spinner=False)
 def _load_regional_calibration_csv(region_key: str) -> Optional[pd.DataFrame]:
     cal_path = PROCESSED_DIR / f"calibration_alpha_{region_key}.csv"
     if cal_path.exists():
@@ -321,6 +321,7 @@ def _run_preset_full_bundle_cached(
         external_overlap_df=ext_overlap_df,
         reference_transition_metrics=ref_tm,
     )
+    result.filtered_points_df = pd.DataFrame()
     del modis_filtered, viirs_filtered, all_dates
 
     if result.monthly_df.empty:
@@ -661,7 +662,11 @@ def _make_raw_vs_harmonized_chart(
     use_frp: bool,
 ) -> go.Figure:
     if granularity == "Annual Total":
-        df = monthly_df.groupby("year", as_index=False).sum(numeric_only=True)
+        current_yr = date.today().year
+        month_counts = monthly_df.groupby("year")["month"].nunique()
+        full_years = [int(y) for y, cnt in month_counts.items() if int(y) < current_yr or int(cnt) == 12]
+        df_src = monthly_df[monthly_df["year"].isin(full_years)] if full_years else monthly_df
+        df = df_src.groupby("year", as_index=False).sum(numeric_only=True)
         x_col = "year"
         transition_x: object = 2012
     else:
@@ -853,7 +858,7 @@ def _make_live_daily_chart(
 
     fig.update_layout(
         title=dict(
-            text="Operational Window (Live / <2 yrs): Daily Harmonization Dynamics",
+            text="Short-Window Mode (< 2 years): Daily Harmonization Dynamics",
             font=dict(size=14),
             x=0.01,
             xanchor="left",
@@ -1225,6 +1230,15 @@ def main() -> None:
             width: 430px !important;
             max-width: 430px !important;
         }
+        @media (max-width: 640px) {
+            section[data-testid="stSidebar"][aria-expanded="true"],
+            section[data-testid="stSidebar"][aria-expanded="true"] > div:first-child,
+            section[data-testid="stSidebar"][aria-expanded="true"] [data-testid="stSidebarContent"] {
+                min-width: 100% !important;
+                width: 100% !important;
+                max-width: 100% !important;
+            }
+        }
         section[data-testid="stSidebar"] [data-testid="stWidgetLabel"] p {
             white-space: normal !important;
             overflow: visible !important;
@@ -1305,14 +1319,14 @@ def main() -> None:
         source_mode = st.radio(
             "Data Source",
             options=[
-                "Preset Archive (2001–2026, Offline)",
+                "Synthetic Benchmark (2001–2026, Offline)",
                 "Upload CSV (FIRMS Archive)",
                 "Live NASA FIRMS Area API",
             ],
             index=0,
             help=(
-                "Choose preloaded 2001–2026 regional archives, upload your own MODIS/VIIRS CSVs "
-                "from FIRMS Archive Download, or query live NRT detections via the FIRMS Area API."
+                "Choose the controlled 2001–2026 Synthetic Benchmark (Ground-Truth Recovery Test), "
+                "upload real MODIS/VIIRS CSVs from FIRMS Archive Download, or query live NRT detections via the FIRMS Area API."
             ),
         )
 
@@ -1410,24 +1424,23 @@ def main() -> None:
 
         elif source_mode == "Live NASA FIRMS Area API":
             st.info(f"Get a free MAP_KEY from [FIRMS Map Key]({FIRMS_MAP_KEY_URL}).")
-            default_key = ""
-            try:
-                default_key = str(st.secrets.get("FIRMS_MAP_KEY", "") or "").strip()
-            except Exception:
-                default_key = ""
-            if not default_key:
-                try:
-                    client_env = FIRMSApiClient()
-                    default_key = client_env.map_key
-                except Exception:
-                    default_key = ""
-            api_key_input = st.text_input(
-                "FIRMS MAP_KEY",
-                value=default_key,
-                type="password",
-                help="Loaded automatically from Streamlit Secrets or local .env when configured.",
+            server_client = FIRMSApiClient()
+            has_server_key = bool(
+                server_client.map_key
+                and server_client.map_key != "your_firms_map_key_here"
             )
-            api_client = FIRMSApiClient(map_key=api_key_input)
+            api_key_input = st.text_input(
+                "FIRMS MAP_KEY (optional)",
+                value="",
+                type="password",
+                placeholder=(
+                    "Server key active (or paste your own key)"
+                    if has_server_key
+                    else "Paste your FIRMS MAP_KEY"
+                ),
+                help="Server key from .env / Streamlit Secrets is used automatically on the backend when left blank.",
+            )
+            api_client = FIRMSApiClient(map_key=api_key_input or None)
 
             if (
                 st.session_state["api_availability_df"].empty
@@ -1596,7 +1609,7 @@ def main() -> None:
     end_date_str = f"{year_max:04d}-12-31"
     viirs_conf_tuple = tuple(sorted(viirs_conf))
 
-    if source_mode == "Preset Archive (2001–2026, Offline)":
+    if source_mode == "Synthetic Benchmark (2001–2026, Offline)":
         active_region_label = REGION_PRESETS[region_key]["name"]
         (
             modis_count,
@@ -1637,7 +1650,7 @@ def main() -> None:
             if raw_modis_df.empty and raw_viirs_df.empty:
                 st.info(
                     "Click **Fetch Data via FIRMS API** in the sidebar to load near real-time "
-                    "NASA FIRMS detections for the selected Bounding Box, or switch to a Preset Archive."
+                    "NASA FIRMS detections for the selected Bounding Box, or switch to the Synthetic Benchmark."
                 )
                 st.stop()
             active_region_label = f"Live FIRMS API ({REGION_PRESETS[region_key]['name']})"
@@ -1718,15 +1731,36 @@ def main() -> None:
     metric_label = "Harmonized FRP (MW)" if use_frp else "Harmonized Hot Spots (1 km cells)"
     tm = result.transition_metrics
     is_ref_mode = bool(tm.get("used_reference_calibration", False))
+    has_overlap = bool(
+        is_ref_mode
+        or (
+            modis_count > 0
+            and viirs_count > 0
+            and not bool(result.calibration_df["used_fallback"].all())
+            and bool(tm.get("has_valid_overlap", True))
+        )
+    )
 
     area_km2 = _compute_bbox_area_km2(active_bbox)
     st.markdown(
         f"**Region:** {active_region_label} · **BBox Area:** {area_km2:,.0f} km² · "
         f"**Filtered Detections:** MODIS `{modis_count:,}` | VIIRS `{viirs_count:,}`"
     )
+    if source_mode == "Synthetic Benchmark (2001–2026, Offline)":
+        st.caption(
+            "🧪 **Synthetic Benchmark Mode (Ground-Truth Recovery Test):** "
+            "Offline simulation (`data/sample/`) with known latent fire activity used to verify "
+            "2012 step-jump suppression and out-of-sample α recovery. For real satellite observations, "
+            "use **Upload CSV (FIRMS Archive)** or **Live NASA FIRMS Area API** in the sidebar."
+        )
     if is_ref_mode:
+        short_mode_title = (
+            "Short-Window Mode (< 2 years · Live NRT API)"
+            if source_mode == "Live NASA FIRMS Area API"
+            else "Short-Window Mode (< 2 years)"
+        )
         st.info(
-            f"ℹ️ **Operational Monitoring Mode (< 2 years / NASA FIRMS NRT API):** "
+            f"ℹ️ **{short_mode_title}:** "
             f"applying pre-computed regional calibration factors `α(m, daynight)` from "
             f"`data/processed/calibration_alpha_{region_key}.csv` and the 2001–2025 baseline climatology "
             f"(active window: `{tm.get('live_raw_points', 0):.0f}` raw detections → "
@@ -1746,12 +1780,17 @@ def main() -> None:
         help="Calendar month with the highest 2001–2025 historical median fire activity.",
     )
     if is_ref_mode:
+        window_kpi_label = (
+            "Window Hot Spots (Live NRT)"
+            if source_mode == "Live NASA FIRMS Area API"
+            else "Window Hot Spots (< 2 yrs)"
+        )
         k2.metric(
-            "Window Hot Spots (Live)",
+            window_kpi_label,
             f"{tm.get('live_harmonized_hotspots', 0):.1f}",
             delta=f"Raw: {tm.get('live_raw_points', 0):.0f} · Cells: {tm.get('live_gridded_cells', 0):.0f}",
             delta_color="off",
-            help="Total α-calibrated 1 km fire hotspots detected within the active operational window.",
+            help="Total α-calibrated 1 km fire hotspots detected within the active short window.",
         )
     else:
         worst_frp = float(kpis.get("worst_year_frp", 0.0))
@@ -1770,13 +1809,22 @@ def main() -> None:
         delta_color="inverse",
         help="Percentage departure and standardized Z-score (σ) vs. the 2001–2025 monthly climatological baseline.",
     )
-    k4.metric(
-        "Calibration α (VIIRS)",
-        f"{tm.get('mean_alpha_overall', 1.0):.3f}",
-        delta=f"-{tm.get('jump_reduction_pct', 0):.0f}% jump · D:{tm.get('mean_alpha_day', 1.0):.2f} N:{tm.get('mean_alpha_night', 1.0):.2f}",
-        delta_color="off",
-        help="Mean VIIRS (375 m) → MODIS (1 km) scaling coefficient across daytime (D) and nighttime (N) overpasses.",
-    )
+    if has_overlap:
+        k4.metric(
+            "Calibration α (VIIRS)",
+            f"{tm.get('mean_alpha_overall', 1.0):.3f}",
+            delta=f"-{tm.get('jump_reduction_pct', 0):.0f}% jump · D:{tm.get('mean_alpha_day', 1.0):.2f} N:{tm.get('mean_alpha_night', 1.0):.2f}",
+            delta_color="off",
+            help="Mean VIIRS (375 m) → MODIS (1 km) scaling coefficient across daytime (D) and nighttime (N) overpasses.",
+        )
+    else:
+        k4.metric(
+            "Calibration α (VIIRS)",
+            "N/A",
+            delta="No MODIS–VIIRS overlap in window",
+            delta_color="off",
+            help="Cross-sensor calibration requires paired MODIS and VIIRS observations (2012–2025).",
+        )
 
     # -----------------------------------------------------------------------
     # Tabs
@@ -1925,39 +1973,67 @@ def main() -> None:
         if is_ref_mode:
             st.caption(
                 f"2012 transition diagnostics and overlap R² below reflect the reference archive for "
-                f"`{REGION_PRESETS[region_key]['name']}` (2001–2026), as the active window spans < 2 years "
+                f"`{REGION_PRESETS[region_key]['name']}` (2001–2025 complete years), as the active window spans < 2 years "
                 f"and uses pre-calibrated `calibration_alpha_{region_key}.csv`."
             )
 
+        if not has_overlap:
+            st.warning(
+                "⚠️ **No MODIS–VIIRS overlap in the selected window:** "
+                "Cross-sensor 2012 step-jump suppression, residual overlap bias, and regression metrics "
+                "require paired MODIS and VIIRS observations (2012–2025). Expand the Year Range or include "
+                "both sensors to evaluate transition metrics."
+            )
+
         m1, m2, m3, m4 = st.columns(4)
-        m1.metric(
-            "Raw Post-2012 Step Jump",
-            f"{tm.get('raw_combined_jump_pct', 0):+.1f}%",
-            delta=f"{tm.get('pre2012_raw_annual_mean', 0):,.0f} → {tm.get('post2012_raw_combined_annual_mean', 0):,.0f} pts/yr",
-            delta_color="inverse",
-            help="Artificial inflation in raw point counts between 2001–2011 (MODIS) and 2013–2026 (MODIS + VIIRS).",
-        )
-        m2.metric(
-            "0.01° Grid Without α",
-            f"{tm.get('gridded_uncalibrated_jump_pct', 0):+.1f}%",
-            delta=f"{tm.get('pre2012_gridded_annual_mean', 0):,.0f} → {tm.get('post2012_gridded_viirs_annual_mean', 0):,.0f} cells/yr",
-            delta_color="inverse",
-            help="Residual discontinuity remaining after 0.01° spatial gridding alone, before α scaling.",
-        )
-        m3.metric(
-            "Residual Sensor Bias (2012–2025)",
-            f"{tm.get('overlap_sensor_residual_bias_pct', 0):+.2f}%",
-            delta="VIIRS·α vs. MODIS overlap",
-            delta_color="off",
-            help="Mean relative difference between calibrated VIIRS·α and MODIS 1 km during the 2012–2025 overlap.",
-        )
-        m4.metric(
-            "2012 Jump Suppression",
-            f"{tm.get('jump_reduction_pct', 0):.2f}%",
-            delta=f"Overlap R² = {tm.get('overlap_r2', 0):.4f}",
-            delta_color="off",
-            help="Fraction of the artificial 2012 sensor step-jump eliminated by the 4-stage pipeline, plus overlap R².",
-        )
+        if has_overlap:
+            m1.metric(
+                "Raw Post-2012 Step Jump",
+                f"{tm.get('raw_combined_jump_pct', 0):+.1f}%",
+                delta=f"{tm.get('pre2012_raw_annual_mean', 0):,.0f} → {tm.get('post2012_raw_combined_annual_mean', 0):,.0f} pts/yr",
+                delta_color="inverse",
+                help="Artificial inflation in raw point counts between 2001–2011 (MODIS) and 2013–2025 complete years (MODIS + VIIRS).",
+            )
+            m2.metric(
+                "0.01° Grid Without α",
+                f"{tm.get('gridded_uncalibrated_jump_pct', 0):+.1f}%",
+                delta=f"{tm.get('pre2012_gridded_annual_mean', 0):,.0f} → {tm.get('post2012_gridded_viirs_annual_mean', 0):,.0f} cells/yr",
+                delta_color="inverse",
+                help="Residual discontinuity remaining after 0.01° spatial gridding alone, before α scaling.",
+            )
+            m3.metric(
+                "Residual Sensor Bias (2012–2025)",
+                f"{tm.get('overlap_sensor_residual_bias_pct', 0):+.2f}%",
+                delta=f"Holdout (2019–25): {tm.get('holdout_bias_pct', 0):+.2f}%",
+                delta_color="off",
+                help=(
+                    "Full overlap (2012–2025) bias and Out-of-Sample holdout bias "
+                    "(α trained on 2012–2018, evaluated on 2019–2025)."
+                ),
+            )
+            m4.metric(
+                "2012 Jump Suppression",
+                f"{tm.get('jump_reduction_pct', 0):.2f}%",
+                delta=f"R²={tm.get('overlap_r2', 0):.4f} · Deseas. r={tm.get('deseasonalized_anomaly_r', 0):.3f}",
+                delta_color="off",
+                help=(
+                    "Fraction of the artificial 2012 sensor step-jump eliminated, plus overlap R² and "
+                    "deseasonalized monthly anomaly correlation r between MODIS and calibrated VIIRS."
+                ),
+            )
+        else:
+            for col_card, title_str in [
+                (m1, "Raw Post-2012 Step Jump"),
+                (m2, "0.01° Grid Without α"),
+                (m3, "Residual Sensor Bias (2012–2025)"),
+                (m4, "2012 Jump Suppression"),
+            ]:
+                col_card.metric(
+                    title_str,
+                    "N/A",
+                    delta="No MODIS–VIIRS overlap in window",
+                    delta_color="off",
+                )
 
         s_col1, s_col2 = st.columns(2)
         with s_col1:

@@ -8,6 +8,7 @@ cross-calibration (2012–2025) with bootstrap 95% confidence intervals.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date
 from typing import Iterable, Optional
 
 import numpy as np
@@ -517,6 +518,18 @@ def build_harmonized_series(
         [range(min_year, max_year + 1), range(1, 13)],
         names=["year", "month"],
     ).to_frame(index=False)
+    today_dt = date.today()
+    if max_year >= today_dt.year:
+        max_obs_month = int(cells.loc[cells["year"] == max_year, "month"].max())
+        cutoff_month = (
+            max(today_dt.month, max_obs_month)
+            if max_year == today_dt.year
+            else max_obs_month
+        )
+        full_grid = full_grid[
+            (full_grid["year"] < max_year)
+            | ((full_grid["year"] == max_year) & (full_grid["month"] <= cutoff_month))
+        ].reset_index(drop=True)
 
     monthly = (
         full_grid.merge(m_sub, on=["year", "month"], how="left")
@@ -599,22 +612,112 @@ def build_harmonized_series(
     return monthly, harmonized_cells
 
 
+def _compute_holdout_and_anomaly_metrics(
+    monthly_df: pd.DataFrame,
+    gridded_df: Optional[pd.DataFrame] = None,
+) -> dict[str, float]:
+    """Compute Out-of-Sample (2012–2018 train -> 2019–2025 test) bias and deseasonalized anomaly r."""
+    holdout_bias_pct = 0.0
+    deseasonalized_r = 0.0
+
+    if not monthly_df.empty:
+        ov_m = monthly_df[
+            (monthly_df["date_label"] >= "2012-03") & (monthly_df["year"] <= 2025)
+        ].copy()
+        ov_active = ov_m[
+            (ov_m["modis_active_cells"] > 0) | (ov_m["viirs_calibrated_cells"] > 0)
+        ].copy()
+        if (
+            len(ov_active) >= 6
+            and (ov_active["modis_active_cells"] > 0).sum() >= 3
+            and (ov_active["viirs_calibrated_cells"] > 0).sum() >= 3
+        ):
+            m_anom = (
+                ov_active["modis_active_cells"]
+                - ov_active.groupby("month")["modis_active_cells"].transform("mean")
+            ).to_numpy(dtype=float)
+            v_anom = (
+                ov_active["viirs_calibrated_cells"]
+                - ov_active.groupby("month")["viirs_calibrated_cells"].transform("mean")
+            ).to_numpy(dtype=float)
+            if float(np.std(m_anom)) > 1e-6 and float(np.std(v_anom)) > 1e-6:
+                deseasonalized_r = float(stats.pearsonr(m_anom, v_anom)[0])
+
+    if gridded_df is not None and not gridded_df.empty:
+        cal_train, _, _ = compute_overlap_calibration(
+            gridded_df,
+            overlap_years=(2012, 2018),
+            n_bootstrap=20,
+        )
+        if not bool(cal_train["used_fallback"].all()):
+            holdout = gridded_df[
+                (gridded_df["year"] >= 2019) & (gridded_df["year"] <= 2025)
+            ]
+            m_hold_sum = float(
+                holdout.loc[holdout["sensor_group"] == "MODIS", "active_cell_count"].sum()
+            )
+            v_hold = holdout[holdout["sensor_group"] == "VIIRS"].merge(
+                cal_train[["month", "daynight", "alpha_cells"]],
+                on=["month", "daynight"],
+                how="left",
+            )
+            v_hold_cal_sum = float(
+                (v_hold["active_cell_count"] * v_hold["alpha_cells"].fillna(1.0)).sum()
+            )
+            if m_hold_sum > 0 and v_hold_cal_sum > 0:
+                holdout_bias_pct = ((v_hold_cal_sum - m_hold_sum) / m_hold_sum) * 100.0
+    elif not monthly_df.empty:
+        train_m = monthly_df[
+            (monthly_df["date_label"] >= "2012-03")
+            & (monthly_df["year"] <= 2018)
+            & (monthly_df["modis_active_cells"] > 0)
+            & (monthly_df["viirs_active_cells"] > 0)
+        ]
+        test_m = monthly_df[
+            (monthly_df["year"] >= 2019) & (monthly_df["year"] <= 2025)
+        ]
+        if not train_m.empty and not test_m.empty:
+            global_a = float(
+                np.median(train_m["modis_active_cells"])
+                / max(np.median(train_m["viirs_active_cells"]), 1e-6)
+            )
+            month_alphas: dict[int, float] = {}
+            for m_num, grp in train_m.groupby("month"):
+                med_v = float(np.median(grp["viirs_active_cells"]))
+                med_m = float(np.median(grp["modis_active_cells"]))
+                month_alphas[int(m_num)] = med_m / max(med_v, 1e-6) if med_v > 0 and med_m > 0 else global_a
+            alphas_series = test_m["month"].map(lambda m: month_alphas.get(int(m), global_a))
+            v_hold_cal = float((test_m["viirs_active_cells"] * alphas_series).sum())
+            m_hold = float(test_m["modis_active_cells"].sum())
+            if m_hold > 0 and v_hold_cal > 0:
+                holdout_bias_pct = ((v_hold_cal - m_hold) / m_hold) * 100.0
+
+    return {
+        "holdout_bias_pct": round(holdout_bias_pct, 2),
+        "deseasonalized_anomaly_r": round(deseasonalized_r, 4),
+    }
+
+
 def evaluate_2012_transition(
     monthly_df: pd.DataFrame,
     calibration_df: pd.DataFrame,
     corr_stats: dict[str, float],
     reference_metrics: Optional[dict[str, float]] = None,
+    gridded_df: Optional[pd.DataFrame] = None,
 ) -> dict[str, float]:
     """Quantify how much of the artificial 2012 sensor step jump was removed.
 
-    For short operational windows (e.g. 1–30 day NRT API queries without both
-    pre-2012 MODIS and post-2012 VIIRS history), optionally carries forward
-    historical regional transition benchmarks via ``reference_metrics`` while
-    reporting live window totals and flagging ``used_reference_calibration``.
+    Excludes the incomplete current calendar year from post-2012 annual means and
+    computes Out-of-Sample holdout validation (2012–2018 train -> 2019–2025 test)
+    plus deseasonalized monthly anomaly correlation.
     """
     annual = monthly_df.groupby("year", as_index=False).sum(numeric_only=True)
-    pre = annual[annual["year"] <= 2011]
-    post = annual[annual["year"] >= 2013]
+    current_year = date.today().year
+    annual_complete = annual[annual["year"] < current_year] if not annual.empty else annual
+    pre = annual_complete[annual_complete["year"] <= 2011]
+    post = annual_complete[annual_complete["year"] >= 2013]
+    if post.empty and not annual.empty:
+        post = annual[annual["year"] >= 2013]
 
     day_alpha = float(calibration_df.loc[calibration_df["daynight"] == "D", "alpha_cells"].mean())
     night_alpha = float(calibration_df.loc[calibration_df["daynight"] == "N", "alpha_cells"].mean())
@@ -652,6 +755,10 @@ def evaluate_2012_transition(
             "overlap_sensor_residual_bias_pct": float(
                 reference_metrics.get("overlap_sensor_residual_bias_pct", 0.0)
             ),
+            "holdout_bias_pct": float(reference_metrics.get("holdout_bias_pct", 0.0)),
+            "deseasonalized_anomaly_r": float(
+                reference_metrics.get("deseasonalized_anomaly_r", 0.0)
+            ),
             "jump_reduction_pct": float(reference_metrics.get("jump_reduction_pct", 0.0)),
             "mean_alpha_day": round(day_alpha, 4),
             "mean_alpha_night": round(night_alpha, 4),
@@ -661,6 +768,7 @@ def evaluate_2012_transition(
             "ols_slope": float(reference_metrics.get("ols_slope", overall_alpha)),
             "ols_intercept": float(reference_metrics.get("ols_intercept", 0.0)),
             "used_reference_calibration": True,
+            "has_valid_overlap": True,
             "live_raw_points": round(live_raw_points, 1),
             "live_gridded_cells": round(live_gridded_cells, 1),
             "live_harmonized_hotspots": round(live_harmonized, 1),
@@ -685,16 +793,31 @@ def evaluate_2012_transition(
     harmonized_diff_pct = _pct_jump(post_harm_mean, pre_harm_mean)
 
     # Sensor-only residual bias during overlap years (2012–2025): calibrated VIIRS vs MODIS
-    ov = annual[(annual["year"] >= 2012) & (annual["year"] <= 2025)]
+    ov = annual_complete[(annual_complete["year"] >= 2012) & (annual_complete["year"] <= 2025)]
+    if ov.empty and not annual.empty:
+        ov = annual[(annual["year"] >= 2012) & (annual["year"] <= 2025)]
     ov_modis = float(ov["modis_active_cells"].sum()) if not ov.empty else 0.0
     ov_viirs_cal = float(ov["viirs_calibrated_cells"].sum()) if not ov.empty else 0.0
-    overlap_sensor_residual_bias_pct = _pct_jump(ov_viirs_cal, ov_modis)
+    has_valid_overlap = bool(
+        ov_modis > 0
+        and ov_viirs_cal > 0
+        and not bool(calibration_df["used_fallback"].all())
+    )
+    overlap_sensor_residual_bias_pct = (
+        _pct_jump(ov_viirs_cal, ov_modis) if has_valid_overlap else 0.0
+    )
 
     jump_reduction_pct = 0.0
-    if abs(raw_combined_jump_pct) > 1e-6:
+    if has_valid_overlap and abs(raw_combined_jump_pct) > 1e-6:
         jump_reduction_pct = float(
             np.clip((1.0 - abs(harmonized_diff_pct) / abs(raw_combined_jump_pct)) * 100.0, 0.0, 100.0)
         )
+
+    oos_metrics = (
+        _compute_holdout_and_anomaly_metrics(monthly_df=monthly_df, gridded_df=gridded_df)
+        if has_valid_overlap
+        else {"holdout_bias_pct": 0.0, "deseasonalized_anomaly_r": 0.0}
+    )
 
     return {
         "pre2012_raw_annual_mean": round(pre_raw_mean, 1),
@@ -708,11 +831,14 @@ def evaluate_2012_transition(
         "post2012_harmonized_annual_mean": round(post_harm_mean, 1),
         "harmonized_diff_pct": round(harmonized_diff_pct, 2),
         "overlap_sensor_residual_bias_pct": round(overlap_sensor_residual_bias_pct, 2),
+        "holdout_bias_pct": oos_metrics["holdout_bias_pct"],
+        "deseasonalized_anomaly_r": oos_metrics["deseasonalized_anomaly_r"],
         "jump_reduction_pct": round(jump_reduction_pct, 2),
         "mean_alpha_day": round(day_alpha, 4),
         "mean_alpha_night": round(night_alpha, 4),
         "mean_alpha_overall": round(overall_alpha, 4),
         "used_reference_calibration": False,
+        "has_valid_overlap": has_valid_overlap,
         "live_raw_points": round(live_raw_points, 1),
         "live_gridded_cells": round(live_gridded_cells, 1),
         "live_harmonized_hotspots": round(live_harmonized, 1),
@@ -778,6 +904,7 @@ class HarmonizationPipeline:
             calibration_df=calibration_df,
             corr_stats=corr_stats,
             reference_metrics=reference_transition_metrics,
+            gridded_df=gridded,
         )
         return HarmonizationResult(
             filtered_points_df=normalized,

@@ -28,11 +28,11 @@ def build_calendar_matrix(
         columns="month",
         values=value_col,
         aggfunc="sum",
-        fill_value=0.0,
+        dropna=False,
     )
     for month in range(1, 13):
         if month not in pivot.columns:
-            pivot[month] = 0.0
+            pivot[month] = np.nan
     pivot = pivot[list(range(1, 13))].sort_index()
     pivot.columns = MONTH_LABELS
     pivot.index.name = "year"
@@ -273,11 +273,13 @@ if __name__ == "__main__":
         )
         print(
             f"  Overlap Sensor Residual Bias (2012–2025 VIIRS_cal vs MODIS): "
-            f"{tm['overlap_sensor_residual_bias_pct']:+.2f}%"
+            f"{tm['overlap_sensor_residual_bias_pct']:+.2f}% | "
+            f"Out-of-Sample Holdout (2019–2025): {tm.get('holdout_bias_pct', 0.0):+.2f}%"
         )
         print(
             f"  2012 Step-Jump Elimination: {tm['jump_reduction_pct']:.2f}% | "
-            f"Overlap R^2={tm['overlap_r2']:.4f} (r={tm['overlap_pearson_r']:.4f})"
+            f"Overlap R^2={tm['overlap_r2']:.4f} (r={tm['overlap_pearson_r']:.4f}, "
+            f"Deseasonalized r={tm.get('deseasonalized_anomaly_r', 0.0):.4f})"
         )
         print(
             f"  Alpha VIIRS->MODIS: Overall={tm['mean_alpha_overall']:.4f} | "

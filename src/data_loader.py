@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import calendar
 import os
+import time
 from datetime import date, timedelta
 from io import StringIO
 from pathlib import Path
@@ -242,6 +243,41 @@ def _resolve_firms_map_key(map_key: Optional[str] = None) -> str:
     return env_key
 
 
+def _safe_http_error(prefix: str, exc: requests.RequestException) -> str:
+    """Format an HTTP/network error without leaking the request URL or secret MAP_KEY."""
+    resp = getattr(exc, "response", None)
+    status_code = getattr(resp, "status_code", None)
+    if status_code is not None:
+        return (
+            f"{prefix} (HTTP {status_code}). "
+            "Check MAP_KEY, bounding box, and date range."
+        )
+    return (
+        f"{prefix} ({exc.__class__.__name__}). "
+        "Check network connection, MAP_KEY, bounding box, and date range."
+    )
+
+
+def _cache_is_fresh(
+    cache_path: Path,
+    date_str: str,
+    day_range: int,
+    nrt_ttl_seconds: int = 3 * 3600,
+) -> bool:
+    """Return True if cached FIRMS CSV exists and is fresh (3-hour TTL for recent NRT dates)."""
+    if not cache_path.exists():
+        return False
+    try:
+        start_dt = date.fromisoformat(str(date_str)[:10])
+        end_dt = start_dt + timedelta(days=max(int(day_range) - 1, 0))
+        if end_dt >= (date.today() - timedelta(days=3)):
+            age_seconds = time.time() - cache_path.stat().st_mtime
+            return age_seconds < nrt_ttl_seconds
+    except Exception:
+        pass
+    return True
+
+
 class FIRMSApiClient:
     """Client for NASA LANCE FIRMS Area API and Data Availability API."""
 
@@ -272,7 +308,9 @@ class FIRMSApiClient:
             resp = requests.get(url, timeout=self.timeout)
             resp.raise_for_status()
         except requests.RequestException as exc:
-            raise FIRMSApiError(f"FIRMS Data Availability request failed: {exc}") from exc
+            raise FIRMSApiError(
+                _safe_http_error("FIRMS Data Availability request failed", exc)
+            ) from None
 
         text = resp.text.strip()
         if not text or text.lower().startswith("invalid"):
@@ -314,7 +352,7 @@ class FIRMSApiClient:
         )
         cache_path = self.cache_dir / cache_name
 
-        if use_cache and cache_path.exists():
+        if use_cache and _cache_is_fresh(cache_path, date_str, int(day_range)):
             return _normalize_common_columns(pd.read_csv(cache_path))
 
         url = FIRMS_AREA_API_URL.format(
@@ -331,7 +369,9 @@ class FIRMSApiClient:
             resp = requests.get(url, timeout=self.timeout)
             resp.raise_for_status()
         except requests.RequestException as exc:
-            raise FIRMSApiError(f"FIRMS Area API request failed: {exc}") from exc
+            raise FIRMSApiError(
+                _safe_http_error("FIRMS Area API request failed", exc)
+            ) from None
 
         text = resp.text.strip()
         if text.lower().startswith("invalid"):
@@ -507,6 +547,7 @@ def generate_regional_sample_data(
     events = pd.concat(event_chunks, ignore_index=True)
     # Deduplicate same cell/date/daynight so 1 latent event maps cleanly to 1 grid cell
     events = events.drop_duplicates(subset=["cell_lat", "cell_lon", "acq_date", "daynight"]).reset_index(drop=True)
+    events = events[events["acq_date"] <= date.today().isoformat()].reset_index(drop=True)
 
     # ------------------------------------------------------------------
     # 1. MODIS Observations (entire period, 1 km resolution)
@@ -539,6 +580,12 @@ def generate_regional_sample_data(
         30,
         100,
     ).astype(int)
+    m_acq_dates = m_base["acq_date"].to_numpy()
+    m_sat = np.where(
+        m_acq_dates < "2002-07-04",
+        "Terra",
+        rng.choice(["Terra", "Aqua"], size=n_m),
+    )
 
     modis_valid = pd.DataFrame(
         {
@@ -547,9 +594,9 @@ def generate_regional_sample_data(
             "brightness": m_bright,
             "scan": m_scan,
             "track": m_track,
-            "acq_date": m_base["acq_date"].to_numpy(),
+            "acq_date": m_acq_dates,
             "acq_time": _format_overpass_time(rng, m_base["daynight"].to_numpy()),
-            "satellite": rng.choice(["Terra", "Aqua"], size=n_m),
+            "satellite": m_sat,
             "instrument": "MODIS",
             "confidence": m_conf,
             "version": "6.1",

@@ -46,13 +46,13 @@ $$\text{Harmonized}(t) = \begin{cases} \text{MODIS\_active\_cells}(t), & t < \te
 
 ---
 
-## 3. Результаты верификации на региональных наборах (2001–2026)
+## 3. Результаты верификации на региональных наборах (2001–2025 полные годы + YTD 2026)
 
-| Регион | Сырой скачок (2001–2011 → 2013–2026) | После сетки 0.01° без $\alpha$ | Остаточный сдвиг сенсоров (2012–2025) | Подавление скачка 2012 | $R^2$ перекрытия |
-| --- | --- | --- | --- | --- | --- |
-| **Córdoba, Argentina (CONAE)** | **+892.2%** | +77.4% | **+0.95%** | **97.92%** | `0.9895` |
-| **Ukraine Forest & Steppe** | **+807.9%** | +63.0% | **+1.48%** | **98.85%** | `0.9898` |
-| **Northern & Central California** | **+835.8%** | +67.5% | **+4.05%** | **98.30%** | `0.9912` |
+| Регион | Сырой скачок (2001–2011 → 2013–2025) | После сетки 0.01° без $\alpha$ | Остаточный сдвиг (2012–2025) | Out-of-Sample Holdout (2019–2025) | Подавление скачка 2012 | $R^2$ перекрытия | Deseasonalized $r$ |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| **Córdoba, Argentina (CONAE)** | **+916.4%** | +81.3% | **+0.39%** | **-0.77%** | **97.74%** | `0.9917` | `0.9849` |
+| **Ukraine Forest & Steppe** | **+821.0%** | +65.3% | **+2.86%** | **-1.65%** | **98.51%** | `0.9895` | `0.9857` |
+| **Northern & Central California** | **+849.9%** | +70.4% | **+4.45%** | **+4.85%** | **98.04%** | `0.9921` | `0.9910` |
 
 ---
 
@@ -104,6 +104,22 @@ E:\fire_harmonizer\.venv\Scripts\python.exe -m src.analytics
 cd E:\fire_harmonizer
 E:\fire_harmonizer\.venv\Scripts\python.exe -m streamlit run E:\fire_harmonizer\app.py
 ```
+
+---
+
+## Limitations & Scientific Scope
+
+1. **Synthetic Benchmark vs. Real Satellite Archives (`data/sample/`)**:
+   - The bundled offline preset (**Synthetic Benchmark (2001–2026, Offline)**) is a controlled multi-sensor simulation with known latent fire events designed as a **Ground-Truth Recovery Test** (verifying that the 4-stage pipeline recovers pre-2012 MODIS-equivalent activity and removes the ~7.6× VIIRS sub-pixel inflation).
+   - For real empirical research and operational fire management, load official satellite exports via **Upload CSV (FIRMS Archive)** ([NASA FIRMS Archive Download](https://firms.modaps.eosdis.nasa.gov/download/)) or query live detections via **Live NASA FIRMS Area API** (chunked in 5-day windows per FIRMS API specification).
+2. **Out-of-Sample Generalization & Biome Specificity**:
+   - Cross-sensor scaling factors $\alpha(m, \text{daynight})$ depend on fuel structure, flame temperature, and diurnal fire behavior (e.g., nighttime smoldering vs. daytime crown fires).
+   - Out-of-sample validation trains $\alpha(m, \text{daynight})$ on `2012–2018` and evaluates on the held-out `2019–2025` period (`holdout_bias_pct` within $\pm 5\%$), alongside deseasonalized monthly anomaly correlation (`deseasonalized_anomaly_r > 0.98`). Custom bounding boxes outside the three benchmark biomes should compute local overlap calibration from multi-year FIRMS archives.
+3. **Spatial Gridding Resolution ($0.01^\circ \times 0.01^\circ \approx 1\text{ km}^2$)**:
+   - Gridding standardizes VIIRS (`375 m`) clusters onto the native MODIS (`1 km`) nadir scale. While this eliminates artificial multi-pixel counting of a single fire perimeter, sub-kilometer spatial detail within individual `1 km` cells is aggregated into `raw_point_count` and `frp_sum`.
+4. **Incomplete Calendar Years & Observational Constraints**:
+   - The current calendar year (`2026 YTD`) is excluded from post-2012 annual mean jump calculations so partial-year totals do not bias multi-decadal comparisons.
+   - Satellite active-fire detections remain subject to cloud cover, heavy smoke obscuration, canopy interception, and orbital overpass timing (`Terra` only prior to July 2002; `Terra + Aqua` from July 2002 onward; `SNPP / NOAA-20` from March 2012 onward).
 
 ---
 
