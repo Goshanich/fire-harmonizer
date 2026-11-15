@@ -146,7 +146,7 @@ streamlit run app.py
 
 ---
 
-## 7. Scientific Scope, Limitations & Attribution
+## 7. Scientific Scope, Limitations & Attribution  
 
 1. **Suomi NPP (`VNP14IMG`) vs. NOAA-20 / NOAA-21 (`VJ114IMG`):** Multi-decade reference calibration uses Suomi NPP VIIRS Collection 2 (`VNP14IMG`, 2012–2025). Live NRT queries against `VIIRS_NOAA20_NRT` inherit orbital timing differences (~50 min offset relative to SNPP) if mixed without platform stratification.
 2. **Pre-Aqua Baseline (`2001–2002`) & Complete Years:** Only Terra MODIS operated prior to `2002-07-04`, so pre/post transition step comparisons (`evaluate_2012_transition`) anchor at `2003–2011` vs. `2013–2025` complete dual-MODIS years to avoid orbital sampling bias. Partial current years (`2026 YTD`) are excluded from annual totals.
