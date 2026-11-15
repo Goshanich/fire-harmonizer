@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
-from typing import Iterable, Optional
+from typing import Any, Iterable, Optional
 
 import numpy as np
 import pandas as pd
@@ -454,6 +454,223 @@ def compute_overlap_calibration(
     return calibration_df, overlap_monthly, corr_stats
 
 
+def build_in_window_calibration(
+    gridded_df: pd.DataFrame,
+    min_cells_threshold: int = 30,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Derive honest in-window MODIS-equivalent scaling factors without invented constants.
+
+    Populates all 12 calendar months x ('D', 'N') so multi-month short windows
+    never leave uncovered months with silent uncalibrated values.
+    """
+    cols = [
+        "month",
+        "daynight",
+        "alpha_cells",
+        "alpha_ci_low",
+        "alpha_ci_high",
+        "alpha_frp",
+        "raw_point_ratio",
+        "overlap_samples",
+        "used_fallback",
+        "n_modis_cells",
+        "n_viirs_cells",
+    ]
+    if gridded_df is None or gridded_df.empty:
+        n_modis_cells = 0
+        n_viirs_cells = 0
+        modis_frp_sum = 0.0
+        viirs_frp_sum = 0.0
+        modis_raw_pts = 0.0
+        viirs_raw_pts = 0.0
+        m_sub = pd.DataFrame()
+        v_sub = pd.DataFrame()
+    else:
+        dn_norm = gridded_df["daynight"].astype(str).str.upper()
+        work = gridded_df.assign(_dn_upper=dn_norm)
+        m_sub = work[work["sensor_group"] == "MODIS"]
+        v_sub = work[work["sensor_group"] == "VIIRS"]
+        n_modis_cells = int(m_sub["active_cell_count"].sum())
+        n_viirs_cells = int(v_sub["active_cell_count"].sum())
+        modis_frp_sum = float(m_sub["frp_sum"].sum())
+        viirs_frp_sum = float(v_sub["frp_sum"].sum())
+        modis_raw_pts = float(m_sub["raw_point_count"].sum())
+        viirs_raw_pts = float(v_sub["raw_point_count"].sum())
+
+    if (
+        n_modis_cells == 0
+        or n_modis_cells < int(min_cells_threshold)
+        or n_viirs_cells < int(min_cells_threshold)
+    ):
+        overall_alpha_cells = 1.0
+        overall_alpha_frp = 1.0
+        raw_point_ratio = 1.0
+        dn_alpha_cells = {"D": 1.0, "N": 1.0}
+        dn_alpha_frp = {"D": 1.0, "N": 1.0}
+        used_fallback = True
+        low_sample_warning = True
+        mode_label = "VIIRS native (not harmonized to MODIS)"
+    else:
+        overall_alpha_cells = float(n_modis_cells / max(n_viirs_cells, 1))
+        overall_alpha_frp = float(modis_frp_sum / max(viirs_frp_sum, 1e-6))
+        raw_point_ratio = (
+            float(modis_raw_pts / max(viirs_raw_pts, 1.0))
+            if modis_raw_pts > 0 and viirs_raw_pts > 0
+            else overall_alpha_cells
+        )
+        dn_alpha_cells = {}
+        dn_alpha_frp = {}
+        for dn in ("D", "N"):
+            m_dn = m_sub[m_sub["_dn_upper"] == dn]
+            v_dn = v_sub[v_sub["_dn_upper"] == dn]
+            n_modis_dn = int(m_dn["active_cell_count"].sum())
+            n_viirs_dn = int(v_dn["active_cell_count"].sum())
+            if n_modis_dn >= 10 and n_viirs_dn >= 10:
+                dn_alpha_cells[dn] = float(n_modis_dn / n_viirs_dn)
+                m_dn_frp = float(m_dn["frp_sum"].sum())
+                v_dn_frp = float(v_dn["frp_sum"].sum())
+                dn_alpha_frp[dn] = (
+                    float(m_dn_frp / max(v_dn_frp, 1e-6))
+                    if m_dn_frp > 0 and v_dn_frp > 0
+                    else overall_alpha_frp
+                )
+            else:
+                dn_alpha_cells[dn] = overall_alpha_cells
+                dn_alpha_frp[dn] = overall_alpha_frp
+
+        used_fallback = False
+        low_sample_warning = False
+        mode_label = (
+            f"In-window MODIS-equivalent (from {n_modis_cells} MODIS / {n_viirs_cells} VIIRS cells)"
+        )
+
+    overlap_samples = int(min(n_modis_cells, n_viirs_cells))
+    rows: list[dict[str, Any]] = []
+    for month in range(1, 13):
+        for dn in ("D", "N"):
+            a_cells = round(float(dn_alpha_cells[dn]), 4)
+            a_frp = round(float(dn_alpha_frp[dn]), 4)
+            rows.append(
+                {
+                    "month": month,
+                    "daynight": dn,
+                    "alpha_cells": a_cells,
+                    "alpha_ci_low": a_cells,
+                    "alpha_ci_high": a_cells,
+                    "alpha_frp": a_frp,
+                    "raw_point_ratio": round(float(raw_point_ratio), 4),
+                    "overlap_samples": overlap_samples,
+                    "used_fallback": used_fallback,
+                    "n_modis_cells": n_modis_cells,
+                    "n_viirs_cells": n_viirs_cells,
+                }
+            )
+
+    calibration_df = pd.DataFrame(rows, columns=cols)
+    meta: dict[str, Any] = {
+        "n_modis_cells": n_modis_cells,
+        "n_viirs_cells": n_viirs_cells,
+        "modis_frp_total": round(modis_frp_sum, 3),
+        "viirs_frp_total": round(viirs_frp_sum, 3),
+        "overall_alpha_cells": float(overall_alpha_cells),
+        "overall_alpha_frp": float(overall_alpha_frp),
+        "alpha_day": float(dn_alpha_cells["D"]),
+        "alpha_night": float(dn_alpha_cells["N"]),
+        "used_fallback": used_fallback,
+        "low_sample_warning": low_sample_warning,
+        "mode_label": mode_label,
+        "min_cells_threshold": int(min_cells_threshold),
+    }
+    return calibration_df, meta
+
+
+def build_daily_sensor_breakdown(
+    gridded_df: pd.DataFrame,
+    harmonized_cells_df: Optional[pd.DataFrame] = None,
+) -> pd.DataFrame:
+    """Aggregate daily active cells and FRP separately for MODIS and VIIRS."""
+    cols = [
+        "acq_date",
+        "modis_raw_points",
+        "modis_cells",
+        "modis_frp",
+        "viirs_raw_points",
+        "viirs_cells",
+        "viirs_frp",
+        "raw_points",
+        "gridded_cells",
+        "harmonized_cells",
+        "harmonized_frp",
+    ]
+    if gridded_df is None or gridded_df.empty:
+        return pd.DataFrame(columns=cols)
+
+    def _agg(sensor: str, prefix: str) -> pd.DataFrame:
+        sub = gridded_df[gridded_df["sensor_group"] == sensor]
+        if sub.empty:
+            return pd.DataFrame(
+                columns=[
+                    "acq_date",
+                    f"{prefix}_raw_points",
+                    f"{prefix}_cells",
+                    f"{prefix}_frp",
+                ]
+            )
+        return sub.groupby("acq_date", as_index=False).agg(
+            **{
+                f"{prefix}_raw_points": ("raw_point_count", "sum"),
+                f"{prefix}_cells": ("active_cell_count", "sum"),
+                f"{prefix}_frp": ("frp_sum", "sum"),
+            }
+        )
+
+    m_daily = _agg("MODIS", "modis")
+    v_daily = _agg("VIIRS", "viirs")
+    daily = pd.merge(m_daily, v_daily, on="acq_date", how="outer").fillna(0.0)
+    daily["raw_points"] = daily["modis_raw_points"] + daily["viirs_raw_points"]
+    daily["gridded_cells"] = daily["modis_cells"] + daily["viirs_cells"]
+
+    if (
+        harmonized_cells_df is not None
+        and not harmonized_cells_df.empty
+        and "calibrated_cell_count" in harmonized_cells_df.columns
+    ):
+        is_ensemble_df = (
+            "period_source" in harmonized_cells_df.columns
+            and "MODIS" in set(harmonized_cells_df["period_source"].astype(str))
+        )
+        if is_ensemble_df and "sensor_group" in harmonized_cells_df.columns:
+            hm = (
+                harmonized_cells_df[harmonized_cells_df["sensor_group"] == "MODIS"]
+                .groupby("acq_date", as_index=False)
+                .agg(_hm_c=("calibrated_cell_count", "sum"), _hm_f=("calibrated_frp", "sum"))
+            )
+            hv = (
+                harmonized_cells_df[harmonized_cells_df["sensor_group"] == "VIIRS"]
+                .groupby("acq_date", as_index=False)
+                .agg(_hv_c=("calibrated_cell_count", "sum"), _hv_f=("calibrated_frp", "sum"))
+            )
+            daily = daily.merge(hm, on="acq_date", how="left").merge(hv, on="acq_date", how="left").fillna(0.0)
+            both = (daily["_hm_c"] > 0) & (daily["_hv_c"] > 0)
+            daily["harmonized_cells"] = np.where(
+                both, 0.5 * (daily["_hm_c"] + daily["_hv_c"]), daily["_hm_c"] + daily["_hv_c"]
+            )
+            daily["harmonized_frp"] = np.where(
+                both, 0.5 * (daily["_hm_f"] + daily["_hv_f"]), daily["_hm_f"] + daily["_hv_f"]
+            )
+        else:
+            h_daily = harmonized_cells_df.groupby("acq_date", as_index=False).agg(
+                harmonized_cells=("calibrated_cell_count", "sum"),
+                harmonized_frp=("calibrated_frp", "sum"),
+            )
+            daily = daily.merge(h_daily, on="acq_date", how="outer").fillna(0.0)
+    else:
+        daily["harmonized_cells"] = daily["gridded_cells"]
+        daily["harmonized_frp"] = 0.0
+
+    return daily[cols].sort_values("acq_date").reset_index(drop=True)
+
+
 def build_harmonized_series(
     gridded_df: pd.DataFrame,
     calibration_df: pd.DataFrame,
@@ -874,6 +1091,7 @@ class HarmonizationPipeline:
         external_calibration_df: Optional[pd.DataFrame] = None,
         external_overlap_df: Optional[pd.DataFrame] = None,
         reference_transition_metrics: Optional[dict[str, float]] = None,
+        calibration_override: Optional[pd.DataFrame] = None,
     ) -> HarmonizationResult:
         """Execute all 4 harmonization stages and return structured outputs."""
         unified = unify_and_filter_sensors(
@@ -889,7 +1107,9 @@ class HarmonizationPipeline:
             gridded,
             overlap_years=self.overlap_years,
         )
-        if external_calibration_df is not None and not external_calibration_df.empty:
+        if calibration_override is not None and not calibration_override.empty:
+            calibration_df = calibration_override.copy()
+        elif external_calibration_df is not None and not external_calibration_df.empty:
             if calibration_df["used_fallback"].all() or gridded["year"].nunique() < 2:
                 calibration_df = external_calibration_df.copy()
                 if external_overlap_df is not None and len(overlap_monthly) < 3:

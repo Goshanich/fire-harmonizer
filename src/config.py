@@ -6,8 +6,9 @@ and inside Linux cloud containers (e.g., Streamlit Community Cloud).
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 # ---------------------------------------------------------------------------
 # Portable Project Storage Paths (Windows E:\ locally or Linux container)
@@ -182,6 +183,68 @@ def build_firms_map_url(
     center_lat = 0.5 * (south + north)
     center_lon = 0.5 * (west + east)
     return f"{FIRMS_MAP_URL}#d:24hrs;@{center_lon:.2f},{center_lat:.2f},{int(zoom)}z"
+
+
+# ---------------------------------------------------------------------------
+# Global Quick Locations & Bounding Box Validation
+# ---------------------------------------------------------------------------
+QUICK_LOCATIONS: dict[str, Optional[tuple[float, float, float, float]]] = {
+    "Custom Coordinates (Manual Input)": None,
+    "Banff National Park, Canada": (-117.317, 50.705, -115.165, 52.271),
+    "Córdoba Province, Argentina": (-65.6, -32.6, -63.8, -30.2),
+    "Ukraine Forest & Steppe": (29.5, 46.5, 38.5, 51.8),
+    "Northern & Central California, USA": (-123.5, 36.5, -118.5, 41.5),
+    "Amazon Basin (Manaus / Pará), Brazil": (-60.0, -6.0, -52.0, -1.0),
+}
+
+
+def validate_bbox(
+    bbox: tuple[float, float, float, float],
+    is_live_api: bool = False,
+    max_span_deg: float = 10.0,
+    api_days: int = 5,
+) -> tuple[bool, str]:
+    """Validate geographic bounding box coordinates and Live API span/day limits."""
+    if not isinstance(bbox, (tuple, list)) or len(bbox) != 4:
+        return False, "Bounding box must contain exactly 4 coordinates: (west, south, east, north)."
+
+    try:
+        vals = [float(v) for v in bbox]
+    except (TypeError, ValueError):
+        return False, "Bounding box coordinates must be numeric."
+
+    if any(isinstance(raw_v, bool) or not math.isfinite(val) for raw_v, val in zip(bbox, vals)):
+        return False, "Bounding box coordinates must be finite numbers."
+
+    west, south, east, north = vals
+    if west < -180.0 or east > 180.0 or west > 180.0 or east < -180.0:
+        return False, "Longitude bounds must stay within [-180.0, 180.0] degrees."
+    if south < -90.0 or north > 90.0 or south > 90.0 or north < -90.0:
+        return False, "Latitude bounds must stay within [-90.0, 90.0] degrees."
+    if west >= east:
+        return (
+            False,
+            f"Invalid longitude bounds: Min Lon (West={west:.3f}) must be strictly less than Max Lon (East={east:.3f}); antimeridian-crossing or inverted boxes are not supported.",
+        )
+    if south >= north:
+        return (
+            False,
+            f"Invalid latitude bounds: Min Lat (South={south:.3f}) must be strictly less than Max Lat (North={north:.3f}).",
+        )
+
+    if is_live_api:
+        lon_span = east - west
+        lat_span = north - south
+        if lon_span > max_span_deg or lat_span > max_span_deg:
+            return (
+                False,
+                f"Live NASA FIRMS Area API bounding box cannot exceed {max_span_deg:.1f}° × {max_span_deg:.1f}° (current span: {lon_span:.2f}° × {lat_span:.2f}°).",
+            )
+        if isinstance(api_days, bool) or int(api_days) < 1 or int(api_days) > 30:
+            return False, "Live NASA FIRMS Area API window length must be between 1 and 30 days."
+
+    return True, ""
+
 
 # ---------------------------------------------------------------------------
 # Regional Presets
